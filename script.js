@@ -15,9 +15,11 @@ let activeDiv          = null;
 let activeEventTab     = 'rankings';
 let cachedEventMatches  = []; // all matches for current event+division
 let cachedOPR           = {}; // { teamName: { opr, dpr, ccwm } }
-let cachedSeasonOPR     = {}; // { teamName: opr } — from prior events this season
-let cachedEventRankings = {}; // { teamName: { rank, wins, losses, ties, winRate, wp } }
-let cachedEventSkills   = {}; // { teamName: { driver, prog, combined, normalized } }
+let cachedSeasonOPR     = {}; // { teamName: { opr, ccwm } } — from prior events this season
+let cachedEventRankings   = {}; // { teamName: { rank, wins, losses, ties, winRate, wp } }
+let cachedEventSkills     = {}; // { teamName: { driver, prog, combined, normalized } }
+let cachedAwardsData      = []; // raw awards from /events/{id}/awards
+let cachedPriorAwardScores = null; // null = not loaded; {} = loaded (teamName → score)
 let currentTeamAtEvent  = null;
 let predWeights         = JSON.parse(localStorage.getItem('predWeights') || 'null') || { opr: 50, ranking: 25, skills: 25 };
 let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions') || 'false');
@@ -48,6 +50,17 @@ async function apiFetch(path) {
   });
   if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
   return res.json();
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Run `tasks` (array of async functions) with at most `concurrency` running simultaneously.
+async function promisePool(tasks, concurrency) {
+  let i = 0;
+  async function worker() {
+    while (i < tasks.length) { await tasks[i++](); }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
 }
 
 async function fetchAllPages(path) {
@@ -237,11 +250,13 @@ async function openEventDetail(ev) {
   currentEvent        = ev;
   activeDiv           = ev.divisions?.[0]?.id ?? null;
   activeEventTab      = 'rankings';
-  cachedEventMatches  = [];
-  cachedOPR           = {};
-  cachedSeasonOPR     = {};
-  cachedEventRankings = {};
-  cachedEventSkills   = {};
+  cachedEventMatches     = [];
+  cachedOPR              = {};
+  cachedSeasonOPR        = {};
+  cachedEventRankings    = {};
+  cachedEventSkills      = {};
+  cachedAwardsData       = [];
+  cachedPriorAwardScores = null;
 
   showView('view-event');
   renderEventHero(ev);
@@ -281,11 +296,13 @@ function renderDivisionSelector(divisions) {
     btn.addEventListener('click', async () => {
       activeDiv = +btn.dataset.id;
       el.querySelectorAll('.div-pill').forEach(b => b.classList.toggle('active', +b.dataset.id === activeDiv));
-      cachedEventMatches  = [];
-      cachedOPR           = {};
-      cachedSeasonOPR     = {};
-      cachedEventRankings = {};
-      cachedEventSkills   = {};
+      cachedEventMatches     = [];
+      cachedOPR              = {};
+      cachedSeasonOPR        = {};
+      cachedEventRankings    = {};
+      cachedEventSkills      = {};
+      cachedAwardsData       = [];
+      cachedPriorAwardScores = null;
       await loadEventTabContent();
     });
   });
@@ -387,13 +404,25 @@ function attachMatchTabListeners(el) {
       simN = +btn.dataset.n;
     });
   });
+  const slider = el.querySelector('#sim-start-slider');
+  const sliderLabel = el.querySelector('#sim-slider-label');
+  if (slider && sliderLabel) {
+    slider.addEventListener('input', () => {
+      const v = +slider.value;
+      sliderLabel.textContent = v > +slider.max - 1 ? 'End (current)' : 'Q-' + v;
+    });
+  }
+
   const runBtn = el.querySelector('#sim-run-btn');
   if (runBtn) {
     runBtn.addEventListener('click', () => {
       runBtn.disabled = true;
       runBtn.textContent = 'Running…';
+      // If slider is at the sentinel "End" position, pass null (no rewind, simulate remaining only)
+      const sliderVal = slider ? +slider.value : null;
+      const fromMatch = (sliderVal != null && sliderVal <= +slider?.max - 1) ? sliderVal : null;
       setTimeout(() => {
-        const results = runRankingSimulation(simN);
+        const results = runRankingSimulation(simN, fromMatch);
         const resultsEl = el.querySelector('#sim-results');
         if (resultsEl) {
           resultsEl.innerHTML = renderSimResults(results);
@@ -407,9 +436,60 @@ function attachMatchTabListeners(el) {
         }
         runBtn.disabled = false;
         runBtn.textContent = 'Run Simulation';
-      }, 0); // defer to let UI update
+      }, 0);
     });
   }
+}
+
+// Fetch prior-season award history for a list of team names (by number string like "2496V").
+// Returns { teamName: rawScore } where rawScore is the sum of PRIOR_AWARD_WEIGHTS for each award
+// the team won at OTHER events this season.
+async function loadPriorAwardScores(teamNames) {
+  if (!teamNames.length || !currentEvent?.season?.id || !currentEvent?.program?.id) return {};
+  const seasonId  = currentEvent.season.id;
+  const programId = currentEvent.program.id;
+  const eventId   = currentEvent.id;
+  const scores    = {};
+
+  // Step 1: batch-resolve team numbers → IDs (20 numbers per request, sequential)
+  const nameToId = {};
+  for (let i = 0; i < teamNames.length; i += 20) {
+    const chunk = teamNames.slice(i, i + 20);
+    try {
+      const qs  = chunk.map(n => `number[]=${encodeURIComponent(n)}`).join('&');
+      const res = await apiFetch(`/teams?${qs}&program[]=${programId}&myTeams=false&per_page=250`);
+      for (const t of (res.data || [])) { if (t.number) nameToId[t.number] = t.id; }
+    } catch (_) {}
+    if (i + 20 < teamNames.length) await sleep(150);
+  }
+
+  // Step 2: fetch awards for each team, 3 at a time to stay under rate limits
+  const resolved = teamNames.filter(n => nameToId[n]);
+  await promisePool(resolved.map(name => async () => {
+    try {
+      const awardsList = await fetchAllPages(`/teams/${nameToId[name]}/awards?season[]=${seasonId}`);
+      let total = 0;
+      const eventsSeen = new Set();
+      for (const a of awardsList) {
+        if (a.event?.id === eventId) continue;
+        if (a.event?.id) eventsSeen.add(a.event.id);
+        total += PRIOR_AWARD_WEIGHTS[classifyAward(a.title)] || 0;
+      }
+      scores[name] = eventsSeen.size > 0 ? total / eventsSeen.size : 0;
+    } catch (_) {}
+  }), 3);
+
+  return scores;
+}
+
+// True when this is a multi-division championship where Excellence is given at a
+// closing/Dome ceremony for the whole event rather than inside each division.
+function isWorldsStyleEvent() {
+  const level = (currentEvent?.level || '').toLowerCase();
+  const name  = (currentEvent?.name  || '').toLowerCase();
+  return level === 'world' ||
+    name.includes('world championship') ||
+    name.includes('vex worlds');
 }
 
 async function loadEventTabContent() {
@@ -463,9 +543,34 @@ async function loadEventTabContent() {
         break;
       }
       case 'awards': {
-        const data = await fetchAllPages(`/events/${eid}/awards`);
-        html = renderEventAwards(data);
-        break;
+        // Awards predictions need rankings + skills data — fetch if not already loaded
+        const [awardsData, rankData, skillsData] = await Promise.all([
+          fetchAllPages(`/events/${eid}/awards`),
+          (!did || Object.keys(cachedEventRankings).length)
+            ? Promise.resolve(null)
+            : fetchAllPages(`/events/${eid}/divisions/${did}/rankings`).catch(() => null),
+          Object.keys(cachedEventSkills).length
+            ? Promise.resolve(null)
+            : fetchAllPages(`/events/${eid}/skills`).catch(() => null),
+        ]);
+        if (rankData)   buildRankingsCache(rankData);
+        if (skillsData) buildSkillsCache(skillsData);
+        cachedAwardsData = awardsData;
+        clearStatus('event-tab');
+        el.innerHTML = renderEventAwards(awardsData);
+        attachMatchTabListeners(el);
+        // Kick off prior-award history fetch in background; re-renders Excellence card when done
+        if (cachedPriorAwardScores === null) {
+          cachedPriorAwardScores = {}; // mark as in-progress to prevent re-entry
+          loadPriorAwardScores(awardsTop40Eligible()).then(scores => {
+            cachedPriorAwardScores = scores;
+            if (activeEventTab === 'awards') {
+              el.innerHTML = renderEventAwards(cachedAwardsData);
+              attachMatchTabListeners(el);
+            }
+          }).catch(() => { cachedPriorAwardScores = {}; });
+        }
+        return; // skip the standard el.innerHTML = html below
       }
       case 'skills': {
         const data = await fetchAllPages(`/events/${eid}/skills`);
@@ -570,7 +675,7 @@ async function loadSeasonOPR() {
       const opr = computeOPR(allMatches.filter(m => m.round === 2));
       const result = {};
       for (const [name, vals] of Object.entries(opr)) {
-        result[name] = vals.opr * weight;
+        result[name] = { opr: vals.opr * weight, ccwm: vals.ccwm * weight };
       }
       return result;
     } catch (_) { return {}; }
@@ -596,10 +701,13 @@ async function loadSeasonOPR() {
 
 // ── Effective OPR: current event → season fallback → rankings/skills proxy ─
 function effectiveOPR(name) {
-  const opr = cachedOPR[name]?.opr;
-  if (opr != null && opr > 0) return opr;
-  const seasonOpr = cachedSeasonOPR[name];
-  if (seasonOpr != null && seasonOpr > 0) return seasonOpr;
+  const entry = cachedOPR[name];
+  if (entry?.opr != null && entry.opr > 0) return entry.opr;
+  const s = cachedSeasonOPR[name];
+  if (s != null) {
+    const val = typeof s === 'object' ? s.opr : s; // handle both old number and new {opr,ccwm} format
+    if (val > 0) return val;
+  }
   // Proxy: rankings/skills strength scaled to event or season OPR magnitude
   const hasRank = Object.keys(cachedEventRankings).length > 0;
   const hasSk   = Object.keys(cachedEventSkills).length > 0;
@@ -613,61 +721,94 @@ function effectiveOPR(name) {
     if (wS > 0) str += (cachedEventSkills[name]?.normalized  || 0) * wS;
     str = Math.max(0.2, str / wT);
   }
-  const allOPRVals = Object.values(cachedOPR).map(o => o.opr);
-  const hasOPRData = allOPRVals.some(v => v > 1);
-  const maxOPR     = Math.max(1, ...allOPRVals);
-  const hasSeasonOPR = Object.keys(cachedSeasonOPR).length > 0;
-  const maxSeasonOPR = hasSeasonOPR ? Math.max(1, ...Object.values(cachedSeasonOPR)) : 1;
+  const allOPRVals = Object.values(cachedOPR).map(o => o.opr).filter(v => v > 0);
+  const hasOPRData = allOPRVals.length > 0;
+  const maxOPR     = hasOPRData ? Math.max(...allOPRVals) : 1;
+  const seasonVals = Object.values(cachedSeasonOPR).map(s => typeof s === 'object' ? s.opr : s).filter(v => v > 0);
+  const hasSeasonOPR = seasonVals.length > 0;
+  const maxSeasonOPR = hasSeasonOPR ? Math.max(...seasonVals) : 1;
   const BASELINE     = hasSeasonOPR ? maxSeasonOPR : 30;
   return str * (hasOPRData ? maxOPR : BASELINE);
 }
 
-// ── Match prediction (weighted: OPR + rankings + skills) ──────────────────
+// CCWM-adjusted "strength" for win probability: OPR + partial CCWM credit.
+// CCWM > 0 means the team contributes more than they allow through — genuinely better.
+// When only OPR is available (no event data yet), falls back to OPR directly.
+function effectiveStrength(name) {
+  const entry = cachedOPR[name];
+  if (entry?.opr > 0) {
+    // Blend: OPR anchors the magnitude, CCWM skews it.
+    // Weight: 55% OPR (keeps scores sensible) + 45% CCWM contribution
+    return Math.max(1, entry.opr * 0.55 + (entry.opr + entry.ccwm) * 0.45);
+  }
+  const s = cachedSeasonOPR[name];
+  if (s != null) {
+    if (typeof s === 'object' && s.ccwm != null) {
+      return Math.max(1, s.opr * 0.55 + (s.opr + s.ccwm) * 0.45);
+    }
+    const val = typeof s === 'object' ? s.opr : s;
+    if (val > 0) return val;
+  }
+  return effectiveOPR(name); // pure fallback
+}
+
+// Compute typical score standard deviation from scored event matches.
+// Used to calibrate Gaussian noise in the simulation.
+function eventScoreStdDev() {
+  const scored = cachedEventMatches.filter(
+    m => m.round === 2 && (m.alliances || []).every(a => isScored(a.score))
+  );
+  if (scored.length < 4) return 15; // default: ±15 pts before enough data
+  const scores = [];
+  for (const m of scored) {
+    const red  = (m.alliances || []).find(a => a.color === 'red');
+    const blue = (m.alliances || []).find(a => a.color === 'blue');
+    if (red && blue) { scores.push(red.score, blue.score); }
+  }
+  if (scores.length < 4) return 15;
+  const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
+  const variance = scores.reduce((a, s) => a + (s - mean) ** 2, 0) / scores.length;
+  // Use 45% of the raw std dev — we want noise around the *prediction*, not raw spread
+  return Math.max(5, Math.sqrt(variance) * 0.45);
+}
+
+// Box-Muller transform: returns one standard-normal sample
+function randn() {
+  const u = 1 - Math.random(), v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ── Match prediction ───────────────────────────────────────────────────────
+// Scores predicted via OPR sums (calibrated to actual point contributions).
+// Winner + confidence predicted via CCWM-adjusted strength (accounts for defense).
+// Confidence uses a logistic curve so large OPR gaps don't over-inflate certainty.
 function predictMatch(m) {
   const alliances = m.alliances || [];
   const red  = alliances.find(a => a.color === 'red')  || alliances[0] || {};
   const blue = alliances.find(a => a.color === 'blue') || alliances[1] || {};
   const redTeams  = (red.teams  || []).map(t => t.team?.name).filter(Boolean);
   const blueTeams = (blue.teams || []).map(t => t.team?.name).filter(Boolean);
+  if (!redTeams.length || !blueTeams.length) return null;
 
-  const hasOPR  = Object.keys(cachedOPR).length > 0;
-  const hasRank = Object.keys(cachedEventRankings).length > 0;
-  const hasSk   = Object.keys(cachedEventSkills).length > 0;
-  if (!hasOPR && !hasRank && !hasSk) return null;
+  // OPR → predicted alliance scores
+  const oprRed  = redTeams.reduce((s, n)  => s + effectiveOPR(n), 0);
+  const oprBlue = blueTeams.reduce((s, n) => s + effectiveOPR(n), 0);
+  if (oprRed + oprBlue <= 0) return null;
 
-  const w    = predWeights;
-  const wOPR  = hasOPR  ? w.opr     : 0;
-  const wRank = hasRank ? w.ranking : 0;
-  const wSk   = hasSk   ? w.skills  : 0;
-  const wTot  = wOPR + wRank + wSk;
-  if (wTot === 0) return null;
+  // CCWM-adjusted strength → win probability (better discriminator than OPR alone)
+  const strRed  = redTeams.reduce((s, n)  => s + effectiveStrength(n), 0);
+  const strBlue = blueTeams.reduce((s, n) => s + effectiveStrength(n), 0);
+  const total   = strRed + strBlue;
+  const diff    = Math.abs(strRed - strBlue);
 
-  const allOPRVals = Object.values(cachedOPR).map(o => o.opr);
-  const maxOPR     = Math.max(1, ...allOPRVals);
-
-  function teamStrength(name) {
-    let s = 0;
-    if (wOPR  > 0) s += ((cachedOPR[name]?.opr || 0) / maxOPR) * wOPR;
-    if (wRank > 0) s += (cachedEventRankings[name]?.winRate ?? 0.5) * wRank;
-    if (wSk   > 0) s += (cachedEventSkills[name]?.normalized  || 0) * wSk;
-    return s / wTot;
-  }
-
-  const redStr  = redTeams.reduce((s, n) => s + teamStrength(n), 0);
-  const blueStr = blueTeams.reduce((s, n) => s + teamStrength(n), 0);
-  const diff    = Math.abs(redStr - blueStr);
-  const tot     = redStr + blueStr;
-  const confidence = tot > 0 ? Math.min(90, Math.round(50 + (diff / tot) * 80)) : 50;
-
-  const rawRed   = redTeams.reduce((s, n)  => s + effectiveOPR(n), 0);
-  const rawBlue  = blueTeams.reduce((s, n) => s + effectiveOPR(n), 0);
-  const canScore = hasOPR || hasRank || hasSk;
-  const redScore  = canScore ? Math.max(0, Math.round(rawRed))  : null;
-  const blueScore = canScore ? Math.max(0, Math.round(rawBlue)) : null;
+  // Logistic confidence: smooth S-curve, asymptotes at ~87%.
+  // tanh(x) ≈ 1 at x≈2, so diff/(total*0.22) = 2 when diff = 44% of total → 87% conf.
+  const confidence = Math.min(87, Math.round(50 + 37 * Math.tanh(diff / (total * 0.22))));
 
   return {
-    redScore, blueScore,
-    winner: redStr > blueStr ? 'red' : blueStr > redStr ? 'blue' : 'tie',
+    redScore:  Math.max(0, Math.round(oprRed)),
+    blueScore: Math.max(0, Math.round(oprBlue)),
+    winner:    strRed > strBlue ? 'red' : strBlue > strRed ? 'blue' : 'tie',
     confidence,
   };
 }
@@ -896,7 +1037,7 @@ function matchDetailHTML(m) {
       </table>
       <p class="match-detail-note">
         ${hasOPR
-          ? 'OPR / DPR / CCWM calculated from all scored qualification matches via least-squares.'
+          ? 'OPR / DPR / CCWM via recency-weighted least-squares. CCWM (win margin contribution) drives win probability; OPR drives score prediction.'
           : 'No scored qualification matches yet — OPR cannot be calculated.'}
       </p>
       ${pred ? buildPredPanel(pred, hasScore ? (red.score > blue.score ? 'red' : blue.score > red.score ? 'blue' : 'tie') : null) : ''}
@@ -904,14 +1045,60 @@ function matchDetailHTML(m) {
     </div>`;
 }
 
+// ── AWP rate from actual match data ───────────────────────────────────────
+// Recomputes base WP (wins×2 + ties×1) from every scored qual match we have,
+// then subtracts from the API's r.wp to get exact AWPs earned per team.
+// This is more reliable than trusting r.wins/r.losses/r.ties from the API.
+function computeAWPRates() {
+  const scored = cachedEventMatches.filter(
+    m => m.round === 2 && (m.alliances || []).every(a => isScored(a.score))
+  );
+
+  const baseWP = {}, played = {};
+  for (const m of scored) {
+    const red  = (m.alliances || []).find(a => a.color === 'red');
+    const blue = (m.alliances || []).find(a => a.color === 'blue');
+    if (!red || !blue) continue;
+    const redNames  = (red.teams  || []).map(t => t.team?.name).filter(Boolean);
+    const blueNames = (blue.teams || []).map(t => t.team?.name).filter(Boolean);
+    const winner = red.score > blue.score ? 'red' : blue.score > red.score ? 'blue' : 'tie';
+    for (const n of redNames) {
+      baseWP[n] = (baseWP[n] || 0) + (winner === 'red' ? 2 : winner === 'tie' ? 1 : 0);
+      played[n] = (played[n] || 0) + 1;
+    }
+    for (const n of blueNames) {
+      baseWP[n] = (baseWP[n] || 0) + (winner === 'blue' ? 2 : winner === 'tie' ? 1 : 0);
+      played[n] = (played[n] || 0) + 1;
+    }
+  }
+
+  // Per-team AWP rate = (actual WP − base WP) / matches played
+  let totalRate = 0, rateCount = 0;
+  const perTeam = {};
+  for (const [name, r] of Object.entries(cachedEventRankings)) {
+    const n = played[name] || 0;
+    if (n === 0) continue;
+    const awps = Math.max(0, (r.wp || 0) - (baseWP[name] || 0));
+    const rate = Math.min(1, awps / n);
+    perTeam[name] = rate;
+    totalRate += rate;
+    rateCount++;
+  }
+
+  const fieldRate = rateCount > 0 ? totalRate / rateCount : 0.15;
+  return { perTeam, fieldRate };
+}
+
 // ── Rankings Simulation ────────────────────────────────────────────────────
 
-function runRankingSimulation(nSims) {
-  // Build the division team set exclusively from the division's match schedule
-  // so we never accidentally include teams from other divisions or events.
+function runRankingSimulation(nSims, fromMatchNum = null) {
+  const quals = cachedEventMatches
+    .filter(m => m.round === 2)
+    .sort((a, b) => a.matchnum - b.matchnum);
+
+  // Build the division team set from the full schedule
   const divTeamNames = new Set();
-  for (const m of cachedEventMatches) {
-    if (m.round !== 2) continue;
+  for (const m of quals) {
     for (const a of (m.alliances || [])) {
       for (const t of (a.teams || [])) {
         if (t.team?.name) divTeamNames.add(t.team.name);
@@ -919,29 +1106,100 @@ function runRankingSimulation(nSims) {
     }
   }
 
-  // Seed team state from current division rankings
-  const teams = {};
-  for (const [name, r] of Object.entries(cachedEventRankings)) {
-    if (!divTeamNames.has(name)) continue; // exclude cross-division contamination
-    const played = r.wins + r.losses + r.ties;
-    const wpFromRecord = r.wins * 2 + r.ties;
-    const surplus = Math.max(0, (r.wp || 0) - wpFromRecord);
-    teams[name] = {
-      wp: r.wp || 0,
-      sp: 0,
-      awpRate: played > 0 ? Math.min(0.9, surplus / played) : 0.2,
-    };
-  }
-  // Add division teams not yet in rankings (no matches played)
-  for (const name of divTeamNames) {
-    if (!teams[name]) teams[name] = { wp: 0, sp: 0, awpRate: 0.2 };
-  }
-
-  const unscored = cachedEventMatches.filter(m =>
-    m.round === 2 && !(m.alliances || []).every(a => isScored(a.score))
+  // A match is "scored" if both alliances have a real score.
+  const scoredNums = new Set(
+    quals.filter(m => (m.alliances || []).every(a => isScored(a.score))).map(m => m.matchnum)
   );
+  // "Rewound" = the slider is pointing at a match that has already been played.
+  // This lets the user replay from any past point — including when the whole event is over.
+  const isRewound = fromMatchNum != null && scoredNums.has(fromMatchNum);
 
-  // Accumulate rank sums over N simulations
+  const priorScored = isRewound
+    ? quals.filter(m => m.matchnum < fromMatchNum && scoredNums.has(m.matchnum))
+    : quals.filter(m => scoredNums.has(m.matchnum));
+
+  // Compute WP, AP, and SP from prior scored matches from scratch
+  const wpAccum   = {};
+  const apAccum   = {};
+  const spAccum   = {};
+  const winsAccum = {};
+  const lossAccum = {};
+  const tiesAccum = {};
+  for (const name of divTeamNames) {
+    wpAccum[name] = apAccum[name] = spAccum[name] = winsAccum[name] = lossAccum[name] = tiesAccum[name] = 0;
+  }
+
+  // Infer AP bonus per match from ranked teams that have played: each team's ap / matches_played
+  // The alliance that wins autonomous gets the bonus — on average ~half the matches.
+  // So apBonusPerWin ≈ (avgApPerMatch) / 0.5 = avgApPerMatch * 2.
+  const apSamples = Object.values(cachedEventRankings).map(r => {
+    const played = (r.wins || 0) + (r.losses || 0) + (r.ties || 0);
+    return played > 2 ? (r.ap || 0) / played : null;
+  }).filter(v => v != null && v > 0);
+  const apBonusPerWin = apSamples.length
+    ? Math.max(1, Math.round((apSamples.reduce((a, b) => a + b) / apSamples.length) * 2))
+    : 3; // default 3 pts (typical VEX bonus)
+
+  for (const m of priorScored) {
+    const red  = (m.alliances || []).find(a => a.color === 'red');
+    const blue = (m.alliances || []).find(a => a.color === 'blue');
+    if (!red || !blue) continue;
+    const redNames  = (red.teams  || []).map(t => t.team?.name).filter(Boolean);
+    const blueNames = (blue.teams || []).map(t => t.team?.name).filter(Boolean);
+    const losingScore = Math.min(red.score, blue.score);
+    for (const n of [...redNames, ...blueNames]) {
+      if (n in spAccum) spAccum[n] += losingScore;
+    }
+    if (red.score > blue.score) {
+      redNames.forEach(n  => { if (n in wpAccum) { wpAccum[n] += 2; winsAccum[n]++; } });
+      blueNames.forEach(n => { if (n in wpAccum) lossAccum[n]++; });
+    } else if (blue.score > red.score) {
+      blueNames.forEach(n => { if (n in wpAccum) { wpAccum[n] += 2; winsAccum[n]++; } });
+      redNames.forEach(n  => { if (n in wpAccum) lossAccum[n]++; });
+    } else {
+      for (const n of [...redNames, ...blueNames]) {
+        if (n in wpAccum) { wpAccum[n] += 1; tiesAccum[n]++; }
+      }
+    }
+  }
+
+  // AWP rates computed directly from actual match outcomes vs API WP totals
+  const { perTeam: awpRates, fieldRate: fieldAwpRate } = computeAWPRates();
+
+  const teams = {};
+  for (const name of divTeamNames) {
+    // Use per-team rate if available (derived from real match data), else field average.
+    // Per-team rate applies in both rewound and normal modes — a team's AWP tendency
+    // doesn't change depending on which point in the event we're simulating from.
+    const awpRate = awpRates[name] ?? fieldAwpRate;
+    // When not rewound, seed directly from API rankings (includes real AWP already earned).
+    // When rewound, estimate AWP earned in prior matches using the field average rate.
+    // AWP is independent of match outcome — earned in ANY match (wins, losses, ties alike).
+    if (!isRewound && cachedEventRankings[name]) {
+      const r = cachedEventRankings[name];
+      teams[name] = { wp: r.wp || 0, ap: r.ap || 0, sp: r.sp || 0, awpRate,
+        priorWins: r.wins, priorLosses: r.losses, priorTies: r.ties };
+    } else {
+      const priorMatches   = winsAccum[name] + lossAccum[name] + tiesAccum[name];
+      const estimatedAwpWP = Math.round(priorMatches * awpRate);
+      teams[name] = {
+        wp: (wpAccum[name] || 0) + estimatedAwpWP,
+        ap: apAccum[name] || 0,
+        sp: spAccum[name] || 0,
+        awpRate,
+        priorWins: winsAccum[name], priorLosses: lossAccum[name], priorTies: tiesAccum[name],
+      };
+    }
+  }
+
+  // Matches to simulate:
+  //   Rewound  → re-play everything from fromMatchNum onward using predictions
+  //              (includes already-scored matches; we treat them as counterfactual)
+  //   Normal   → only the remaining unscored matches
+  const toSim = isRewound
+    ? quals.filter(m => m.matchnum >= fromMatchNum)
+    : quals.filter(m => !scoredNums.has(m.matchnum));
+
   const rankSums   = {};
   const wpSums     = {};
   const rankCounts = {};
@@ -953,80 +1211,82 @@ function runRankingSimulation(nSims) {
     rankCounts[name] = {};
   }
 
-  const numTeams = Object.keys(teams).length;
+  const numTeams      = Object.keys(teams).length;
   const playoffCutoff = Math.min(16, Math.max(4, Math.floor(numTeams * 0.3)));
 
+  // Calibrate score noise from actual event data: each simulated match samples
+  // predicted scores + Gaussian noise → winner determined by score comparison.
+  // This lets win probability and tie rate emerge naturally from score distributions
+  // instead of relying on hard-coded confidence thresholds.
+  const scoreStdDev = eventScoreStdDev();
+
+  // Pre-compute predictions outside the sim loop (they don't change per simulation)
+  const matchPreds = toSim.map(m => ({ m, pred: predictMatch(m) })).filter(x => x.pred);
+
   for (let sim = 0; sim < nSims; sim++) {
-    // Clone team WP/AP/SP from current state
     const simTeams = {};
     for (const [n, t] of Object.entries(teams)) {
-      simTeams[n] = { wp: t.wp, ap: 0, sp: 0, awpRate: t.awpRate };
+      simTeams[n] = { wp: t.wp, ap: t.ap, sp: t.sp, awpRate: t.awpRate };
     }
 
-    for (const m of unscored) {
+    for (const { m, pred } of matchPreds) {
       const alliances = m.alliances || [];
       const red  = alliances.find(a => a.color === 'red')  || alliances[0];
       const blue = alliances.find(a => a.color === 'blue') || alliances[1];
       if (!red || !blue) continue;
 
-      const pred = predictMatch(m);
-      if (!pred) continue;
-
-      // Stochastic outcome: confidence drives win probability
-      const conf = pred.confidence / 100;
-      const rand = Math.random();
-      let winner; // 'red', 'blue', or 'tie'
-      if (pred.winner === 'tie') {
-        winner = rand < 0.1 ? 'red' : rand < 0.2 ? 'blue' : 'tie';
-      } else {
-        const favWins = rand < conf;
-        winner = favWins ? pred.winner : (pred.winner === 'red' ? 'blue' : 'red');
-        if (rand < 0.05) winner = 'tie'; // small tie probability
-      }
-
       const redNames  = (red.teams  || []).map(t => t.team?.name).filter(Boolean);
       const blueNames = (blue.teams || []).map(t => t.team?.name).filter(Boolean);
 
-      const addWP = (names, wps) => {
-        for (const n of names) {
-          if (!simTeams[n]) simTeams[n] = { wp: 0, ap: 0, sp: 0, awpRate: 0.2 };
-          simTeams[n].wp += wps;
-          // AWP only for teams that earned match points (winners/ties); losers get 0
-          if (wps > 0 && Math.random() < simTeams[n].awpRate) simTeams[n].wp += 1;
-        }
-      };
+      // Sample scores from a Gaussian centred on the OPR prediction.
+      // Win probability and tie rate emerge naturally — no hard-coded numbers.
+      const simRed  = Math.max(0, Math.round(pred.redScore  + randn() * scoreStdDev));
+      const simBlue = Math.max(0, Math.round(pred.blueScore + randn() * scoreStdDev));
+      const winner  = simRed > simBlue ? 'red' : simBlue > simRed ? 'blue' : 'tie';
 
-      // SP = losing alliance's predicted score
-      const redSP  = pred.redScore  ?? 0;
-      const blueSP = pred.blueScore ?? 0;
+      // SP = the losing alliance's actual simulated score (correct VEX rule)
+      const loserSP = winner === 'red' ? simBlue : winner === 'blue' ? simRed : simRed;
+      for (const n of [...redNames, ...blueNames]) {
+        if (simTeams[n]) simTeams[n].sp += loserSP;
+      }
+
+      // AP tiebreaker: award autonomous bonus to the alliance that wins the autonomous period.
+      // Probability weighted by relative alliance strength (stronger alliance more likely to win auto).
+      const strRed  = redNames.reduce((s, n)  => s + effectiveStrength(n), 0) || 1;
+      const strBlue = blueNames.reduce((s, n) => s + effectiveStrength(n), 0) || 1;
+      const autoWinner = Math.random() < strRed / (strRed + strBlue) ? 'red' : 'blue';
+      const apNames = autoWinner === 'red' ? redNames : blueNames;
+      for (const n of apNames) { if (simTeams[n]) simTeams[n].ap += apBonusPerWin; }
+
+      // AWP is earned by completing the autonomous objective — independent of match outcome.
+      // Either alliance can earn AWP even if they lose the overall match.
+      const redAWP  = Math.random() < (simTeams[redNames[0]]?.awpRate  ?? fieldAwpRate);
+      const blueAWP = Math.random() < (simTeams[blueNames[0]]?.awpRate ?? fieldAwpRate);
 
       if (winner === 'red') {
-        addWP(redNames, 2); addWP(blueNames, 0);
-        for (const n of redNames)  { if (simTeams[n]) simTeams[n].sp += blueSP; }
-        for (const n of blueNames) { if (simTeams[n]) simTeams[n].sp += blueSP; }
+        for (const n of redNames)  { if (simTeams[n]) { simTeams[n].wp += 2 + (redAWP  ? 1 : 0); } }
+        for (const n of blueNames) { if (simTeams[n]) { simTeams[n].wp += 0 + (blueAWP ? 1 : 0); } }
         redNames.forEach(n  => { if (winSums[n]  != null) winSums[n]++;  });
         blueNames.forEach(n => { if (lossSums[n] != null) lossSums[n]++; });
       } else if (winner === 'blue') {
-        addWP(blueNames, 2); addWP(redNames, 0);
-        for (const n of redNames)  { if (simTeams[n]) simTeams[n].sp += redSP; }
-        for (const n of blueNames) { if (simTeams[n]) simTeams[n].sp += redSP; }
+        for (const n of blueNames) { if (simTeams[n]) { simTeams[n].wp += 2 + (blueAWP ? 1 : 0); } }
+        for (const n of redNames)  { if (simTeams[n]) { simTeams[n].wp += 0 + (redAWP  ? 1 : 0); } }
         blueNames.forEach(n => { if (winSums[n]  != null) winSums[n]++;  });
         redNames.forEach(n  => { if (lossSums[n] != null) lossSums[n]++; });
       } else {
-        addWP(redNames, 1); addWP(blueNames, 1);
-        for (const n of redNames)  { if (simTeams[n]) simTeams[n].sp += blueSP; }
-        for (const n of blueNames) { if (simTeams[n]) simTeams[n].sp += redSP; }
+        for (const n of redNames)  { if (simTeams[n]) { simTeams[n].wp += 1 + (redAWP  ? 1 : 0); } }
+        for (const n of blueNames) { if (simTeams[n]) { simTeams[n].wp += 1 + (blueAWP ? 1 : 0); } }
         [...redNames, ...blueNames].forEach(n => { if (tieSums[n] != null) tieSums[n]++; });
       }
     }
 
-    // Sort by WP → AP → SP and record ranks
+    // Sort by official VEX tiebreaker order: WP → AP → SP
     const sorted = Object.entries(simTeams)
       .sort(([, a], [, b]) => b.wp - a.wp || b.ap - a.ap || b.sp - a.sp);
     sorted.forEach(([name], i) => {
       const r = i + 1;
-      rankSums[name]    = (rankSums[name]  || 0) + r;
-      wpSums[name]      = (wpSums[name]    || 0) + simTeams[name].wp;
+      rankSums[name]      = (rankSums[name]  || 0) + r;
+      wpSums[name]        = (wpSums[name]    || 0) + simTeams[name].wp;
       rankCounts[name][r] = (rankCounts[name][r] || 0) + 1;
     });
   }
@@ -1037,22 +1297,25 @@ function runRankingSimulation(nSims) {
     return Math.round((c / nSims) * 100);
   };
 
-  // Build results: average rank, WP, rank distribution, and playoff probability
   return Object.keys(rankSums)
-    .map(name => ({
-      name,
-      avgRank:    rankSums[name] / nSims,
-      avgWP:      +(wpSums[name] / nSims).toFixed(1),
-      current:    cachedEventRankings[name] || null,
-      rankCounts: rankCounts[name],
-      playoffPct: playoffProb(name),
-      avgWins:    +(winSums[name] / nSims).toFixed(1),
-      avgLosses:  +(lossSums[name] / nSims).toFixed(1),
-      avgTies:    +(tieSums[name] / nSims).toFixed(1),
-      numTeams,
-      playoffCutoff,
-    }))
-    .sort((a, b) => a.avgRank - b.avgRank);
+    .map(name => {
+      const t = teams[name];
+      return {
+        name,
+        avgRank:    rankSums[name] / nSims,
+        avgWP:      +(wpSums[name] / nSims).toFixed(1),
+        current:    cachedEventRankings[name] || null,
+        rankCounts: rankCounts[name],
+        playoffPct: playoffProb(name),
+        // Avg simulated record (from start point) + prior played matches
+        avgWins:    +(winSums[name] / nSims + t.priorWins).toFixed(1),
+        avgLosses:  +(lossSums[name] / nSims + t.priorLosses).toFixed(1),
+        avgTies:    +(tieSums[name] / nSims + t.priorTies).toFixed(1),
+        numTeams,
+        playoffCutoff,
+      };
+    })
+    .sort((a, b) => b.avgWP - a.avgWP || a.avgRank - b.avgRank);
 }
 
 function renderSimMatchTable() {
@@ -1109,6 +1372,30 @@ function renderSimTab() {
   const simOptions = [10, 100, 500, 1000];
   const defaultSim = 100;
 
+  // Build sorted match list for the slider
+  const sortedQuals = quals.slice().sort((a, b) => a.matchnum - b.matchnum);
+  const matchNums   = sortedQuals.map(m => m.matchnum);
+  const minMatch    = matchNums[0] || 1;
+  const maxMatch    = matchNums[matchNums.length - 1] || 1;
+  // Default start = first unscored match.
+  // If all matches are scored we use maxMatch+1 (one past the end) as a sentinel:
+  //   scoredNums.has(maxMatch+1) === false → isRewound=false → toSim=[] → shows current final standings.
+  const firstUnscored = sortedQuals.find(m => !(m.alliances || []).every(a => isScored(a.score)));
+  const sliderMax     = maxMatch + 1;          // extra sentinel position for "current/end"
+  const defaultStart  = firstUnscored ? firstUnscored.matchnum : sliderMax;
+
+  function simSliderLabel(v) {
+    return +v > maxMatch ? 'End (current)' : 'Q-' + v;
+  }
+
+  const sliderHtml =
+    '<div class="sim-slider-row">' +
+    '<span class="sim-label">Simulate from:</span>' +
+    '<input type="range" id="sim-start-slider" class="sim-slider" ' +
+    'min="' + minMatch + '" max="' + sliderMax + '" value="' + defaultStart + '" step="1" />' +
+    '<span class="sim-slider-label" id="sim-slider-label">' + simSliderLabel(defaultStart) + '</span>' +
+    '</div>';
+
   const controls =
     '<div class="sim-controls">' +
     '<span class="sim-label">Simulations:</span>' +
@@ -1118,20 +1405,13 @@ function renderSimTab() {
     '<button class="btn-primary sim-run-btn" id="sim-run-btn">Run Simulation</button>' +
     '</div>';
 
-  const divTeamCount = new Set(
-    cachedEventMatches.filter(m => m.round === 2).flatMap(m =>
-      (m.alliances || []).flatMap(a => (a.teams || []).map(t => t.team?.name).filter(Boolean))
-    )
-  ).size;
-  const cutoff = Math.min(16, Math.max(4, Math.floor(divTeamCount * 0.3)));
-
   const info =
     '<p class="sim-info">' + unscoredCount + ' unscored qual match' + (unscoredCount !== 1 ? 'es' : '') +
-    ' remaining · Alliance selection cutoff: top ' + cutoff + ' of ' + divTeamCount + ' teams</p>';
+    ' remaining · ' + quals.length + ' total quals · Monte Carlo: CCWM-adjusted OPR predictions + score-distribution sampling</p>';
 
   return '<div class="stats-section">' +
     '<div class="section-title">Predicted Final Rankings</div>' +
-    info + controls +
+    info + sliderHtml + controls +
     '<div id="sim-results"></div>' +
     '</div>';
 }
@@ -1163,15 +1443,13 @@ function renderSimResults(results) {
       : delta < 0
       ? '<span class="rank-dn">▼' + Math.abs(delta) + '</span>'
       : '<span class="rank-same">–</span>';
-    const cls = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
-    const elimCls = r.playoffPct >= 60 ? 'playoff-high' : r.playoffPct >= 30 ? 'playoff-mid' : 'playoff-low';
-    const record  = r.avgWins + '-' + r.avgLosses + (r.avgTies > 0 ? '-' + r.avgTies : '');
+    const cls    = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+    const record = r.avgWins + '-' + r.avgLosses + (r.avgTies > 0 ? '-' + r.avgTies : '');
     return '<tr>' +
       '<td><span class="rank-badge ' + cls + '">#' + (i + 1) + '</span></td>' +
       '<td><button class="team-link" data-num="' + esc(r.name) + '">' + esc(r.name) + '</button></td>' +
       '<td style="color:var(--text-muted)">' + curRank + '</td>' +
       '<td>' + deltaStr + '</td>' +
-      '<td class="' + elimCls + '">' + r.playoffPct + '%</td>' +
       '<td style="color:var(--text-muted);font-size:.8rem">' + record + '</td>' +
       '<td style="font-weight:600">' + r.avgWP + '</td>' +
       '<td>' + renderRankBar(r.rankCounts, nSims, numTeams) + '</td>' +
@@ -1180,7 +1458,7 @@ function renderSimResults(results) {
 
   return '<div class="table-wrap"><table class="sim-results-table">' +
     '<thead><tr><th>Pred.</th><th>Team</th><th>Now</th><th>Δ</th>' +
-    '<th>Elim%</th><th>Record</th><th>Avg WP</th><th>Distribution</th></tr></thead>' +
+    '<th>Record</th><th>Avg WP</th><th>Distribution</th></tr></thead>' +
     '<tbody>' + rows + '</tbody></table></div>';
 }
 
@@ -1244,13 +1522,137 @@ const COUNTRY_COORDS = {
 
 const PROGRAM_IDS = { all: null, v5rc: 1, viqrc: 4, vexu: 41 };
 
-let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, sourceView: 'view-search' };
+let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, markerLayer: null, heatLayer: null, heatmap: false, sourceView: 'view-search' };
+let _mapLoadGen = 0; // incremented on each loadMapData call to cancel stale batches
 
 function destroyLeafletMap() {
   if (mapState.leafletMap) {
     mapState.leafletMap.remove();
     mapState.leafletMap = null;
+    mapState.markerLayer = null;
+    mapState.heatLayer = null;
   }
+}
+
+// Dynamically loads the leaflet.heat plugin (no-op if already present)
+function ensureLeafletHeat() {
+  if (window.L?.heatLayer) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js';
+    s.onload  = () => resolve(true);
+    s.onerror = () => resolve(false);
+    document.head.appendChild(s);
+  });
+}
+
+function buildHeatPoints(teams) {
+  const grade = mapState.grade;
+  const pts = [];
+  for (const t of teams) {
+    if (grade !== 'all' && t.grade !== grade) continue;
+    let lat = t.location?.coordinates?.lat;
+    let lon = t.location?.coordinates?.lon;
+    if ((lat == null || lon == null) && t.location?.country && COUNTRY_COORDS[t.location.country]) {
+      [lat, lon] = COUNTRY_COORDS[t.location.country];
+    }
+    if (lat != null && lon != null) pts.push([lat, lon]);
+  }
+  return pts;
+}
+
+function initLeafletMap() {
+  if (mapState.leafletMap) return; // already live
+  const container = document.getElementById('map-container');
+  container.innerHTML = '';
+  container.style.height = '480px';
+  if (typeof L === 'undefined') {
+    container.innerHTML = '<p class="empty" style="padding:20px">Map library failed to load.</p>';
+    return;
+  }
+  const m = L.map(container, { zoomControl: true, scrollWheelZoom: true });
+  mapState.leafletMap = m;
+  L.tileLayer('https://api.maptiler.com/maps/dataviz/{z}/{x}/{y}.png?key=v2zClPQKX8x55Lzh1OxJ', {
+    attribution: '© <a href="https://www.maptiler.com/copyright/">MapTiler</a> © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+  }).addTo(m);
+  mapState.markerLayer = L.layerGroup().addTo(m);
+  setTimeout(() => { m.invalidateSize(); m.setView([20, 10], 2); }, 50);
+}
+
+function buildDots(teams) {
+  const grade = mapState.grade;
+  const dots = {};
+  const byCountry = {};
+  for (const t of teams) {
+    if (grade !== 'all' && t.grade !== grade) continue;
+    const country  = t.location?.country;
+    const teamInfo = { name: t.name, number: t.number || t.name, grade: t.grade, country, programId: t.program?.id ?? t.program };
+
+    let lat = t.location?.coordinates?.lat;
+    let lon = t.location?.coordinates?.lon;
+    if ((lat == null || lon == null) && country && COUNTRY_COORDS[country]) {
+      [lat, lon] = COUNTRY_COORDS[country];
+    }
+    if (lat != null && lon != null) {
+      const key = lat.toFixed(2) + ',' + lon.toFixed(2);
+      if (!dots[key]) dots[key] = { lat, lon, city: t.location?.city || '', teams: [] };
+      dots[key].teams.push(teamInfo);
+    }
+    if (country) {
+      if (!byCountry[country]) byCountry[country] = { count: 0, teams: [] };
+      byCountry[country].count++;
+      byCountry[country].teams.push(teamInfo);
+    }
+  }
+  return { dots, byCountry };
+}
+
+function updateMapOverlay(teams) {
+  if (!mapState.leafletMap || !mapState.markerLayer) return;
+  const { dots, byCountry } = buildDots(teams);
+  mapState.countryData = byCountry;
+  mapState.dots = dots;
+
+  if (mapState.heatmap && window.L?.heatLayer) {
+    // Heatmap mode — hide dot markers, update heat layer
+    mapState.markerLayer.clearLayers();
+    const pts = buildHeatPoints(teams);
+    if (mapState.heatLayer) {
+      mapState.heatLayer.setLatLngs(pts);
+    } else {
+      mapState.heatLayer = L.heatLayer(pts, {
+        radius: 35, blur: 30, maxZoom: 16, max: 1.0, minOpacity: 0.45,
+        gradient: { 0.2: '#0ea5e9', 0.45: '#6366f1', 0.7: '#f59e0b', 1.0: '#ef4444' },
+      }).addTo(mapState.leafletMap);
+    }
+  } else {
+    // Dot mode — remove heat layer, rebuild circle markers
+    if (mapState.heatLayer) { mapState.heatLayer.remove(); mapState.heatLayer = null; }
+    mapState.markerLayer.clearLayers();
+    const maxAtDot = Math.max(1, ...Object.values(dots).map(d => d.teams.length));
+    for (const dot of Object.values(dots)) {
+      const count  = dot.teams.length;
+      const frac   = count / maxAtDot;
+      const radius = count === 1 ? 5 : 5 + Math.sqrt(frac) * 18;
+      const hue    = count === 1 ? 210 : Math.round(210 - frac * 180);
+      const marker = L.circleMarker([dot.lat, dot.lon], {
+        radius, fillColor: `hsl(${hue},75%,45%)`, color: '#fff',
+        weight: 1, opacity: 0.9, fillOpacity: 0.8,
+      }).addTo(mapState.markerLayer);
+      const tipLabel = count === 1
+        ? '<strong>' + esc(dot.teams[0].number) + '</strong>'
+        : '<strong>' + count + ' teams</strong> at this location';
+      marker.bindTooltip(tipLabel, { direction: 'top', offset: [0, -4] });
+      marker.on('click', () => showMapDotsPanel(dot));
+    }
+  }
+
+  const total = Object.values(byCountry).reduce((s, d) => s + d.count, 0);
+  const legendEl = document.getElementById('map-legend');
+  if (legendEl) legendEl.innerHTML =
+    '<div class="map-legend"><span>1 team</span><div class="map-legend-bar"></div><span>Many teams</span>' +
+    '<span style="margin-left:auto;color:var(--text-muted)">' + total.toLocaleString() + ' teams · ' + Object.keys(byCountry).length + ' countries</span></div>';
 }
 
 async function openMapView(eventId) {
@@ -1263,7 +1665,6 @@ async function openMapView(eventId) {
   // Default to V5RC on global view so we don't try to load every team on earth
   if (!eventId) mapState.programId = mapState.programId || 1;
 
-  const progKey = Object.entries(PROGRAM_IDS).find(([, v]) => v === mapState.programId)?.[0] || 'v5rc';
 
   const filterEl = document.getElementById('map-filters');
   filterEl.innerHTML =
@@ -1271,22 +1672,26 @@ async function openMapView(eventId) {
     (eventId
       ? '<span class="sim-label">Showing teams at: <strong>' + esc(currentEvent?.name || 'Event') + '</strong></span>'
       : '<select class="map-filter-select" id="map-prog-select">' +
-        '<option value="all">All Programs</option>' +
-        '<option value="v5rc"' + (progKey === 'v5rc' ? ' selected' : '') + '>V5RC</option>' +
-        '<option value="viqrc"' + (progKey === 'viqrc' ? ' selected' : '') + '>VIQRC</option>' +
-        '<option value="vexu"' + (progKey === 'vexu' ? ' selected' : '') + '>VEXU</option>' +
+        '<option value="all"' + (mapState.programId === null ? ' selected' : '') + '>All Programs</option>' +
+        '<option value="v5rc"'  + (mapState.programId === 1  ? ' selected' : '') + '>V5RC</option>' +
+        '<option value="viqrc"' + (mapState.programId === 4  ? ' selected' : '') + '>VIQRC</option>' +
+        '<option value="vexu"'  + (mapState.programId === 41 ? ' selected' : '') + '>VEXU</option>' +
         '</select>' +
         '<select class="map-filter-select" id="map-grade-select">' +
-        '<option value="all"' + (mapState.grade === 'all' ? ' selected' : '') + '>All Grades</option>' +
-        '<option value="Middle School"' + (mapState.grade === 'Middle School' ? ' selected' : '') + '>Middle School</option>' +
-        '<option value="High School"' + (mapState.grade === 'High School' ? ' selected' : '') + '>High School</option>' +
-        '<option value="College"' + (mapState.grade === 'College' ? ' selected' : '') + '>College</option>' +
+        '<option value="all"'          + (mapState.grade === 'all'           ? ' selected' : '') + '>All Grades</option>' +
+        '<option value="Middle School"'+ (mapState.grade === 'Middle School' ? ' selected' : '') + '>Middle School</option>' +
+        '<option value="High School"'  + (mapState.grade === 'High School'   ? ' selected' : '') + '>High School</option>' +
+        '<option value="College"'      + (mapState.grade === 'College'       ? ' selected' : '') + '>College</option>' +
         '</select>') +
+    '<button class="map-toggle-btn' + (mapState.heatmap ? ' active' : '') + '" id="map-heat-toggle" title="Toggle smooth heatmap">Heatmap</button>' +
     '</div>';
 
   if (!eventId) {
     document.getElementById('map-prog-select').addEventListener('change', e => {
       mapState.programId = PROGRAM_IDS[e.target.value] ?? null;
+      // Reset grade to all when switching programs to avoid empty maps
+      mapState.grade = 'all';
+      document.getElementById('map-grade-select').value = 'all';
       loadMapData();
     });
     document.getElementById('map-grade-select').addEventListener('change', e => {
@@ -1294,6 +1699,16 @@ async function openMapView(eventId) {
       applyMapGradeFilter();
     });
   }
+
+  document.getElementById('map-heat-toggle').addEventListener('click', async function () {
+    if (!mapState.heatmap) {
+      const ok = await ensureLeafletHeat();
+      if (!ok) return;
+    }
+    mapState.heatmap = !mapState.heatmap;
+    this.classList.toggle('active', mapState.heatmap);
+    if (mapState.allTeams) updateMapOverlay(mapState.allTeams);
+  });
 
   const panel = document.getElementById('map-country-panel');
   panel.classList.add('hidden');
@@ -1311,159 +1726,131 @@ async function getActiveSeasonId(programId) {
   } catch { return null; }
 }
 
-async function fetchMapTeams(url, maxPages = 20) {
-  const all = [];
+// Slim down a team object to only the fields the map needs, to keep the cache small.
+function slimTeam(t) {
+  return {
+    number:   t.number,
+    name:     t.name,
+    grade:    t.grade,
+    program:  t.program?.id,
+    location: t.location ? { country: t.location.country, coordinates: t.location.coordinates } : null,
+  };
+}
+
+// onBatch(newTeams) is called with each page's teams as they arrive.
+async function fetchMapTeams(url, onBatch) {
+  const cacheKey = 'mapteams3_' + url.replace(/[^a-z0-9]/gi, '_').slice(-80);
+  try {
+    const raw = localStorage.getItem(cacheKey);
+    if (raw) {
+      const { ts, data } = JSON.parse(raw);
+      // Only trust cache entries with a plausible number of teams
+      if (Date.now() - ts < 24 * 60 * 60 * 1000 && data.length > 50) {
+        onBatch?.(data);
+        return data;
+      }
+    }
+  } catch (_) {}
+
   const sep = url.includes('?') ? '&' : '?';
-  for (let page = 1; page <= maxPages; page++) {
-    const json = await apiFetch(`${url}${sep}page=${page}&per_page=250`);
-    if (!json.data?.length) break;
-    all.push(...json.data);
-    if (!json.meta || page >= json.meta.last_page) break;
+
+  // Fetch page 1 to learn last_page, then fire the rest in parallel
+  const first = await apiFetch(`${url}${sep}page=1&per_page=250`);
+  if (!first.data?.length) return [];
+  const all = first.data.map(slimTeam);
+  const lastPage = first.meta?.last_page ?? 1;
+  onBatch?.(all.slice()); // first batch
+
+  let failCount = 0;
+  if (lastPage > 1) {
+    const pages = Array.from({ length: lastPage - 1 }, (_, i) => i + 2);
+    await promisePool(pages.map(p => async () => {
+      try {
+        const json = await apiFetch(`${url}${sep}page=${p}&per_page=250`);
+        if (json.data?.length) {
+          const batch = json.data.map(slimTeam);
+          all.push(...batch);
+          onBatch?.(batch);
+        }
+      } catch (_) { failCount++; }
+    }), 12);
   }
+
+  // Only cache if we got a complete (or near-complete) result
+  if (failCount === 0) {
+    try { localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), data: all })); } catch (_) {}
+  }
+
   return all;
 }
 
 async function loadMapData() {
+  const gen = ++_mapLoadGen; // cancel any in-flight batches from a previous load
   destroyLeafletMap();
   const container = document.getElementById('map-container');
-  container.innerHTML = '<p class="empty" style="padding:20px">Loading team data…</p>';
+  container.innerHTML = '<p class="empty" style="padding:20px">Loading…</p>';
+  mapState.grade = mapState.grade || 'all';
+
+  const accTeams = [];
+  let renderTimer = null;
+
+  function scheduleOverlayUpdate() {
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => {
+      if (gen !== _mapLoadGen) return; // superseded
+      initLeafletMap();
+      mapState.allTeams = accTeams.slice();
+      updateMapOverlay(accTeams);
+    }, 250);
+  }
+
+  function onBatch(newTeams) {
+    if (gen !== _mapLoadGen) return; // superseded
+    accTeams.push(...newTeams);
+    scheduleOverlayUpdate();
+  }
 
   try {
-    let teams;
     if (mapState.eventId) {
-      // Event-specific: fetch all teams at this event (usually < 200, no cap needed)
-      teams = await fetchAllPages(`/events/${mapState.eventId}/teams`);
+      const teams = await fetchAllPages(`/events/${mapState.eventId}/teams`);
+      accTeams.push(...teams);
     } else if (mapState.programId) {
       const seasonId = await getActiveSeasonId(mapState.programId);
       const url = `/teams?myTeams=false&registered=true&program[]=${mapState.programId}` +
         (seasonId ? `&season[]=${seasonId}` : '');
-      teams = await fetchMapTeams(url, 20); // cap at 20 pages = 5000 teams
+      await fetchMapTeams(url, onBatch);
     } else {
-      // All programs — fetch current registered teams per program in parallel
-      const programIds = [1, 4, 41]; // V5RC, VIQRC, VEXU
-      const chunks = await Promise.all(programIds.map(async pid => {
+      const programIds = [1, 4, 41];
+      await Promise.all(programIds.map(async pid => {
         const seasonId = await getActiveSeasonId(pid);
         const url = `/teams?myTeams=false&registered=true&program[]=${pid}` +
           (seasonId ? `&season[]=${seasonId}` : '');
-        return fetchMapTeams(url, 10); // 10 pages per program
+        await fetchMapTeams(url, onBatch);
       }));
-      teams = chunks.flat();
     }
-    mapState.allTeams = teams;
-    mapState.grade    = mapState.grade || 'all';
-    buildAndRenderMap(teams);
+    // Final render (clears any pending debounce)
+    clearTimeout(renderTimer);
+    initLeafletMap();
+    mapState.allTeams = accTeams.slice();
+    updateMapOverlay(accTeams);
   } catch (err) {
-    container.innerHTML = '<p class="empty">Error loading team data: ' + esc(err.message) + '</p>';
+    clearTimeout(renderTimer);
+    if (!mapState.leafletMap) {
+      container.innerHTML = '<p class="empty">Error loading team data: ' + esc(err.message) + '</p>';
+    }
   }
 }
 
 function applyMapGradeFilter() {
   if (!mapState.allTeams) return;
-  buildAndRenderMap(mapState.allTeams);
+  initLeafletMap();
+  updateMapOverlay(mapState.allTeams);
 }
 
 function buildAndRenderMap(teams) {
-  const grade = mapState.grade;
-  // Collect teams with coordinates; fall back to country centroid if no lat/lon
-  const dots = {}; // key = "lat,lon" (rounded to 2dp) → { lat, lon, teams[] }
-  const byCountry = {};
-
-  for (const t of teams) {
-    if (grade !== 'all' && t.grade !== grade) continue;
-    const country = t.location?.country;
-    const teamInfo = { name: t.team_name || t.name || t.number, number: t.number, grade: t.grade, country, programId: t.program?.id };
-
-    // Prefer exact coordinates from API
-    let lat = t.location?.coordinates?.lat;
-    let lon = t.location?.coordinates?.lon;
-
-    // Fall back to country centroid
-    if ((lat == null || lon == null) && country && COUNTRY_COORDS[country]) {
-      [lat, lon] = COUNTRY_COORDS[country];
-    }
-
-    if (lat != null && lon != null) {
-      const key = lat.toFixed(2) + ',' + lon.toFixed(2);
-      if (!dots[key]) {
-        const city = t.location?.city || '';
-        dots[key] = { lat, lon, city, teams: [] };
-      }
-      dots[key].teams.push(teamInfo);
-    }
-
-    // Also aggregate by country for the legend count
-    if (country) {
-      if (!byCountry[country]) byCountry[country] = { count: 0, teams: [] };
-      byCountry[country].count++;
-      byCountry[country].teams.push(teamInfo);
-    }
-  }
-
-  mapState.countryData = byCountry;
-  mapState.dots = dots;
-  renderLeafletMap(dots, byCountry);
-}
-
-function renderLeafletMap(dots, countryData) {
-  destroyLeafletMap();
-  const container = document.getElementById('map-container');
-  container.innerHTML = '';
-  container.style.height = '480px';
-
-  if (typeof L === 'undefined') {
-    container.innerHTML = '<p class="empty" style="padding:20px">Map library failed to load. Check your internet connection.</p>';
-    return;
-  }
-
-  const leafletMap = L.map(container, { zoomControl: true, scrollWheelZoom: true });
-  mapState.leafletMap = leafletMap;
-
-  L.tileLayer('https://api.maptiler.com/maps/dataviz/{z}/{x}/{y}.png?key=v2zClPQKX8x55Lzh1OxJ', {
-    attribution: '© <a href="https://www.maptiler.com/copyright/">MapTiler</a> © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    maxZoom: 19,
-  }).addTo(leafletMap);
-
-  setTimeout(() => {
-    leafletMap.invalidateSize();
-    leafletMap.setView([20, 10], 2);
-  }, 50);
-
-  const maxAtDot = Math.max(1, ...Object.values(dots).map(d => d.teams.length));
-  let totalTeams = 0;
-
-  for (const dot of Object.values(dots)) {
-    totalTeams += dot.teams.length;
-    const count  = dot.teams.length;
-    const frac   = count / maxAtDot;
-    // Single team: small blue dot. Multiple teams: grows and shifts toward red.
-    const radius = count === 1 ? 5 : 5 + Math.sqrt(frac) * 18;
-    const hue    = count === 1 ? 210 : Math.round(210 - frac * 180);
-    const color  = `hsl(${hue},75%,45%)`;
-
-    const marker = L.circleMarker([dot.lat, dot.lon], {
-      radius,
-      fillColor:   color,
-      color:       '#fff',
-      weight:      1,
-      opacity:     0.9,
-      fillOpacity: 0.8,
-    }).addTo(leafletMap);
-
-    const tipLabel = count === 1
-      ? '<strong>' + esc(dot.teams[0].number) + '</strong> ' + esc(dot.teams[0].name)
-      : '<strong>' + count + ' teams</strong> at this location';
-    marker.bindTooltip(tipLabel, { direction: 'top', offset: [0, -4] });
-    marker.on('click', () => showMapDotsPanel(dot));
-  }
-
-  const total = Object.values(countryData).reduce((s, d) => s + d.count, 0);
-  const legendEl = document.getElementById('map-legend');
-  legendEl.innerHTML =
-    '<div class="map-legend">' +
-    '<span>1 team</span><div class="map-legend-bar"></div><span>Many teams</span>' +
-    '<span style="margin-left:auto;color:var(--text-muted)">' +
-    total.toLocaleString() + ' teams · ' + Object.keys(countryData).length + ' countries</span>' +
-    '</div>';
+  mapState.allTeams = teams;
+  initLeafletMap();
+  updateMapOverlay(teams);
 }
 
 function showMapDotsPanel(dot) {
@@ -1547,21 +1934,20 @@ function showMapDotsPanel(dot) {
   });
 }
 
-// ── OPR / DPR / CCWM (least-squares) ──────────────────────────────────────
+// ── OPR / DPR / CCWM (least-squares, recency-weighted) ────────────────────
 function computeOPR(qualMatches) {
-  // Build team index from scored matches only
+  // Only use scored matches; sort oldest→newest so decay weights are correct
+  const scored = qualMatches
+    .filter(m => (m.alliances || []).every(a => isScored(a.score)))
+    .sort((a, b) => a.matchnum - b.matchnum);
+
   const teamNames = [];
   const teamIdx   = {};
-
-  qualMatches.forEach(m => {
+  scored.forEach(m => {
     (m.alliances || []).forEach(a => {
-      if (!isScored(a.score)) return;
       (a.teams || []).forEach(t => {
         const name = t.team?.name;
-        if (name && !(name in teamIdx)) {
-          teamIdx[name] = teamNames.length;
-          teamNames.push(name);
-        }
+        if (name && !(name in teamIdx)) { teamIdx[name] = teamNames.length; teamNames.push(name); }
       });
     });
   });
@@ -1569,17 +1955,21 @@ function computeOPR(qualMatches) {
   const n = teamNames.length;
   if (n === 0) return {};
 
-  // Build normal equations A^T A x = A^T b
+  const N = scored.length;
+  // Gentle exponential recency weighting: newest match weight = 1,
+  // oldest = e^(−DECAY*N). DECAY=0.07 → after ~14 matches oldest is ~0.37× newest.
+  const DECAY = 0.07;
+
   const ATA   = Array.from({ length: n }, () => new Array(n).fill(0));
   const ATb_o = new Array(n).fill(0);
   const ATb_d = new Array(n).fill(0);
 
-  qualMatches.forEach(m => {
+  scored.forEach((m, idx) => {
+    const w = Math.exp(DECAY * (idx - N + 1)); // ranges from e^(-N*DECAY) to 1
     const alliances = m.alliances || [];
     const red  = alliances.find(a => a.color === 'red')  || alliances[0];
     const blue = alliances.find(a => a.color === 'blue') || alliances[1];
     if (!red || !blue) return;
-    if (!isScored(red.score) || !isScored(blue.score)) return;
 
     for (const [ally, ownScore, oppScore] of [
       [red,  red.score,  blue.score],
@@ -1588,11 +1978,10 @@ function computeOPR(qualMatches) {
       const indices = (ally.teams || [])
         .map(t => teamIdx[t.team?.name])
         .filter(i => i !== undefined);
-
       indices.forEach(i => {
-        ATb_o[i] += ownScore;
-        ATb_d[i] += oppScore;
-        indices.forEach(j => { ATA[i][j]++; });
+        ATb_o[i] += ownScore * w;
+        ATb_d[i] += oppScore * w;
+        indices.forEach(j => { ATA[i][j] += w; });
       });
     }
   });
@@ -1629,33 +2018,365 @@ function gaussianElim(A, b, n) {
   );
 }
 
+// ── Award classification ────────────────────────────────────────────────────
+const AWARD_INFO = {
+  excellence:    { icon: '🏆', cat: 'excellence',  criteria: 'top40',      desc: 'Top 40% in qual rankings, combined skills, and autonomous skills (> 0 required)' },
+  champion:      { icon: '🥇', cat: 'performance', criteria: 'qual_rank',  desc: 'Best record in qualification matches' },
+  finalist:      { icon: '🥈', cat: 'performance', criteria: 'qual_rank2', desc: 'Second-best record in qualification matches' },
+  skills_champ:  { icon: '⚙️', cat: 'performance', criteria: 'skills',     desc: 'Highest combined Driver + Programming Skills score' },
+  skills_2nd:    { icon: '🎖️', cat: 'performance', criteria: 'skills',     desc: 'Second-highest combined Skills score' },
+  high_score:    { icon: '📈', cat: 'performance', criteria: 'match_score',desc: 'Highest single-match alliance score' },
+  design:        { icon: '📐', cat: 'notebook',    criteria: 'notebook',   desc: 'Outstanding Engineering Notebook and design process — fully judged' },
+  innovate:      { icon: '💡', cat: 'notebook',    criteria: 'notebook',   desc: 'Novel design or strategy, well-documented in notebook — fully judged' },
+  think:         { icon: '🧠', cat: 'notebook',    criteria: 'auto_gt0',   desc: 'Outstanding programming — must have Autonomous Skills score > 0' },
+  amaze:         { icon: '✨', cat: 'notebook',    criteria: 'skills_rank', desc: 'Consistently high-performing robot across quals and skills challenges' },
+  build:         { icon: '🔧', cat: 'notebook',    criteria: 'notebook',   desc: 'Exceptional robot construction and mechanical craftsmanship — fully judged' },
+  create:        { icon: '🎨', cat: 'notebook',    criteria: 'notebook',   desc: 'Creative engineering solutions to game challenges — fully judged' },
+  judges:        { icon: '⚖️', cat: 'special',     criteria: 'none',       desc: 'Judges\' discretionary award for exceptional qualities' },
+  inspire:       { icon: '🌟', cat: 'conduct',     criteria: 'none',       desc: 'Passion, positivity, and integrity throughout the event' },
+  sportsmanship: { icon: '🤝', cat: 'conduct',     criteria: 'top40',      desc: 'Exemplary sportsmanship — top 40% in qual rankings and skills' },
+  energy:        { icon: '⚡', cat: 'conduct',     criteria: 'none',       desc: 'Outstanding enthusiasm and excitement at the event' },
+  other:         { icon: '🏅', cat: 'other',       criteria: 'none',       desc: '' },
+};
+
+function classifyAward(title) {
+  const t = (title || '').toLowerCase();
+  if (t.includes('excellence'))                                         return 'excellence';
+  if (t.includes('tournament champion') || t.includes('division champion') || t.includes('teamwork champion')) return 'champion';
+  if (t.includes('robot skills champion') || (t.includes('skills') && t.includes('champion'))) return 'skills_champ';
+  if (t.includes('finalist') || (t.includes('second place') && !t.includes('skills')))         return 'finalist';
+  if (t.includes('skills') && t.includes('second'))                    return 'skills_2nd';
+  if (t.includes('high score') || t.includes('highest score'))         return 'high_score';
+  if (t.includes('design'))                                             return 'design';
+  if (t.includes('innovate'))                                           return 'innovate';
+  if (t.includes('think'))                                              return 'think';
+  if (t.includes('amaze'))                                              return 'amaze';
+  if (t.includes('build'))                                              return 'build';
+  if (t.includes('create'))                                             return 'create';
+  if (t.includes('judge'))                                              return 'judges';
+  if (t.includes('inspire'))                                            return 'inspire';
+  if (t.includes('sportsmanship'))                                      return 'sportsmanship';
+  if (t.includes('energy'))                                             return 'energy';
+  return 'other';
+}
+
+// ── Award eligibility / prediction helpers ─────────────────────────────────
+
+function awardsTop40Eligible() {
+  const rankEntries = Object.entries(cachedEventRankings);
+  const total = rankEntries.length;
+  if (!total) return [];
+
+  const qualCutoff = Math.ceil(total * 0.4);
+
+  // Skills ranking (by combined score)
+  const skillsRanked = Object.entries(cachedEventSkills)
+    .sort(([, a], [, b]) => (b.driver + b.prog) - (a.driver + a.prog));
+  const skillsCutoffScore = skillsRanked[Math.ceil(skillsRanked.length * 0.4) - 1]?.[1]?.combined ?? 0;
+
+  // Autonomous-only ranking — must have score > 0 AND be in top 40%
+  const autoRanked = Object.entries(cachedEventSkills)
+    .filter(([, s]) => (s.prog || 0) > 0)
+    .sort(([, a], [, b]) => b.prog - a.prog);
+  const autoCutoffScore = autoRanked[Math.ceil(autoRanked.length * 0.4) - 1]?.[1]?.prog ?? 1;
+
+  return rankEntries
+    .filter(([name, r]) => {
+      if (r.rank > qualCutoff) return false;
+      const sk = cachedEventSkills[name];
+      if (!sk) return false;
+      if (sk.combined < skillsCutoffScore) return false;
+      if ((sk.prog || 0) < autoCutoffScore) return false;
+      return true;
+    })
+    .map(([name]) => name);
+}
+
+// Points assigned to each prior-event judged award type when building the history bonus.
+// Excellence at a prior event is the strongest signal; conduct/special awards count minimally.
+const PRIOR_AWARD_WEIGHTS = {
+  excellence:    5.0,
+  design:        4.0,
+  innovate:      3.0,
+  think:         3.0,
+  amaze:         2.5,
+  build:         2.0,
+  create:        2.0,
+  judges:        1.0,
+  inspire:       0.5,
+  sportsmanship: 0.5,
+};
+
+// Returns a 0–1 composite score for Excellence / Sportsmanship prediction.
+// When prior award scores are available (cachedPriorAwardScores loaded), blends them in.
+// Weights without history : 40% qual, 35% skills, 25% auto
+// Weights with history    : 35% qual, 30% skills, 20% auto, 15% prior awards
+function compositeAwardScore(name) {
+  const r   = cachedEventRankings[name];
+  const sk  = cachedEventSkills[name];
+  const tot = Object.keys(cachedEventRankings).length;
+
+  const qualPct = (r && tot > 1) ? (tot - r.rank) / (tot - 1) : 0;
+  const skPct   = sk?.normalized ?? 0;
+
+  const autoVals    = Object.values(cachedEventSkills).map(s => s.prog || 0).sort((a, b) => b - a);
+  const autoRankIdx = sk ? autoVals.findIndex(v => v <= (sk.prog || 0)) : autoVals.length;
+  const autoPct     = autoVals.length > 1 ? (autoVals.length - autoRankIdx - 1) / (autoVals.length - 1) : 0;
+
+  const hasPrior = cachedPriorAwardScores && Object.keys(cachedPriorAwardScores).length > 0;
+  if (!hasPrior) {
+    return qualPct * 0.40 + skPct * 0.35 + autoPct * 0.25;
+  }
+
+  // Normalise prior scores to 0–1 against the max among eligible teams
+  const allPrior = Object.values(cachedPriorAwardScores);
+  const maxPrior = Math.max(1, ...allPrior);
+  const priorPct = Math.min(1, (cachedPriorAwardScores[name] || 0) / maxPrior);
+
+  return qualPct * 0.35 + skPct * 0.30 + autoPct * 0.20 + priorPct * 0.15;
+}
+
 // ── Event Awards ───────────────────────────────────────────────────────────
 function renderEventAwards(awards) {
-  if (!awards.length) return `
-    <div class="stats-section">
+  const hasRankings = Object.keys(cachedEventRankings).length > 0;
+  const hasSkills   = Object.keys(cachedEventSkills).length > 0;
+
+  // Sort API awards by order field
+  const apiAwards = [...awards].sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  function renderAwardCard(type, a /* may be null if no API data yet */) {
+    const info    = AWARD_INFO[type] || AWARD_INFO.other;
+    const title   = a?.title || info.icon + ' ' + type;
+    const given   = a && (a.teams || []).length > 0;
+    const quals   = a?.qualifications?.length
+      ? `<div class="award-qual-tag">Qualifies: ${esc(a.qualifications.join(', '))}</div>` : '';
+
+    // Winner block (when award has been given)
+    let winnerHtml = '';
+    if (given) {
+      const winnerBtns = (a.teams || []).map(t => {
+        if (t.team?.name) return `<button class="team-link award-winner-btn" data-num="${esc(t.team.name)}">${esc(t.team.name)}</button>`;
+        if (t.person)     return `<span class="award-person">${esc(t.person)}</span>`;
+        return '';
+      }).filter(Boolean).join('');
+      winnerHtml = `<div class="award-winner-row"><span class="award-winner-label">Winner</span>${winnerBtns}</div>`;
+    }
+
+    // Prediction / eligible teams block
+    let predHtml = '';
+    if (!given) {
+      if (info.criteria === 'top40' && hasRankings && hasSkills) {
+        // At VEX Worlds, Excellence is announced at the Dome ceremony for the entire event,
+        // not per division. Show a banner and use this division's data as an indicator only.
+        const worldsBanner = isWorldsStyleEvent()
+          ? `<div class="award-pred-note-block award-worlds-note">
+               <strong>VEX Worlds:</strong> The Excellence Award is announced at the Dome closing ceremony for the full event — not per division. This table reflects divisional performance and is for reference only.
+             </div>`
+          : '';
+        const eligible = awardsTop40Eligible();
+        if (eligible.length) {
+          const ranked = eligible
+            .map(name => ({ name, score: compositeAwardScore(name) }))
+            .sort((a, b) => b.score - a.score);
+
+          // Prior award loading states
+          const priorLoading  = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length === 0;
+          const priorReady    = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length > 0;
+          const priorFetching = cachedPriorAwardScores === null; // null means in-progress (set to {} immediately)
+
+          const priorNote = priorFetching || priorLoading
+            ? `<span class="award-prior-loading">⏳ Loading prior award history…</span>`
+            : priorReady
+            ? `<span class="award-prior-ready">✓ Prior award history included</span>`
+            : '';
+
+          const showPriorCol = priorReady;
+
+          const rows = ranked.map((e, i) => {
+            const r        = cachedEventRankings[e.name];
+            const sk       = cachedEventSkills[e.name];
+            const pct      = Math.round(e.score * 100);
+            const priorRaw = cachedPriorAwardScores?.[e.name] ?? null;
+            const priorCell = showPriorCol
+              ? `<td class="aw-stat aw-prior">${priorRaw ? priorRaw.toFixed(1) : '—'}</td>`
+              : '';
+            return `<tr>
+              <td class="aw-rank">${i + 1}</td>
+              <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
+              <td class="aw-stat">Q${r?.rank ?? '—'}</td>
+              <td class="aw-stat">${sk ? (sk.driver + sk.prog) : '—'}</td>
+              <td class="aw-stat">${sk?.prog ?? '—'}</td>
+              ${priorCell}
+              <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${pct}%"></div><span>${pct}%</span></td>
+            </tr>`;
+          }).join('');
+
+          const priorHead = showPriorCol ? '<th title="Avg judged award weight per event this season">Prior/Evt</th>' : '';
+          const weightNote = showPriorCol
+            ? '35% qual · 30% skills · 20% auto · 15% award history'
+            : '40% qual · 35% skills · 25% auto';
+
+          predHtml = `
+            ${worldsBanner}
+            <div class="award-pred-section">
+              <div class="award-pred-title">
+                Eligible teams <span class="award-pred-note">(top 40% qual + skills + auto · ${weightNote})</span>
+                ${priorNote}
+              </div>
+              <div class="table-wrap"><table class="award-table">
+                <thead><tr><th>#</th><th>Team</th><th>Qual</th><th>Skills</th><th>Auto</th>${priorHead}<th>Score</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table></div>
+            </div>`;
+        } else if (hasRankings || hasSkills) {
+          predHtml = worldsBanner + `<div class="award-pred-note-block">Eligibility check: no teams currently meet top-40% threshold in all three categories.</div>`;
+        } else {
+          predHtml = worldsBanner + `<div class="award-pred-note-block">Eligibility data loads once rankings and skills are available.</div>`;
+        }
+      } else if (info.criteria === 'qual_rank' && hasRankings) {
+        const top3 = Object.entries(cachedEventRankings)
+          .sort(([, a], [, b]) => a.rank - b.rank).slice(0, 5);
+        const rows = top3.map(([name, r]) => `<tr>
+          <td class="aw-rank">${r.rank}</td>
+          <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+          <td class="aw-stat">${r.wins}–${r.losses}–${r.ties}</td>
+          <td class="aw-stat">WP ${r.wp}</td>
+        </tr>`).join('');
+        predHtml = `<div class="award-pred-section">
+          <div class="award-pred-title">Current qual standings</div>
+          <div class="table-wrap"><table class="award-table">
+            <thead><tr><th>Rank</th><th>Team</th><th>W-L-T</th><th>WP</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>
+        </div>`;
+      } else if (info.criteria === 'skills' && hasSkills) {
+        const top5 = Object.entries(cachedEventSkills)
+          .sort(([, a], [, b]) => (b.driver + b.prog) - (a.driver + a.prog)).slice(0, 5);
+        const rows = top5.map(([name, sk], i) => `<tr>
+          <td class="aw-rank">#${i + 1}</td>
+          <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+          <td class="aw-stat">${sk.driver}</td>
+          <td class="aw-stat">${sk.prog}</td>
+          <td class="aw-stat" style="font-weight:700">${sk.driver + sk.prog}</td>
+        </tr>`).join('');
+        predHtml = `<div class="award-pred-section">
+          <div class="award-pred-title">Current skills standings</div>
+          <div class="table-wrap"><table class="award-table">
+            <thead><tr><th>#</th><th>Team</th><th>Driver</th><th>Auto</th><th>Total</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>
+        </div>`;
+      } else if (info.criteria === 'auto_gt0' && hasSkills) {
+        const eligible = Object.entries(cachedEventSkills)
+          .filter(([, sk]) => (sk.prog || 0) > 0)
+          .sort(([, a], [, b]) => b.prog - a.prog).slice(0, 8);
+        if (eligible.length) {
+          const rows = eligible.map(([name, sk], i) => `<tr>
+            <td class="aw-rank">#${i + 1}</td>
+            <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+            <td class="aw-stat" style="font-weight:700">${sk.prog}</td>
+          </tr>`).join('');
+          predHtml = `<div class="award-pred-section">
+            <div class="award-pred-title">Teams with Auto score > 0 (${eligible.length} eligible)</div>
+            <div class="table-wrap"><table class="award-table">
+              <thead><tr><th>#</th><th>Team</th><th>Auto Score</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table></div>
+          </div>`;
+        } else {
+          predHtml = `<div class="award-pred-note-block">No teams have an Autonomous Skills score yet.</div>`;
+        }
+      } else if (info.criteria === 'skills_rank' && hasSkills) {
+        // Amaze: skills + qual combined
+        const allNames = [...new Set([
+          ...Object.keys(cachedEventSkills),
+          ...Object.keys(cachedEventRankings),
+        ])];
+        const scored = allNames
+          .map(name => {
+            const sk = cachedEventSkills[name];
+            const r  = cachedEventRankings[name];
+            const tot = Object.keys(cachedEventRankings).length;
+            const skPct  = sk?.normalized ?? 0;
+            const rnkPct = (r && tot > 1) ? (tot - r.rank) / (tot - 1) : 0;
+            return { name, score: skPct * 0.6 + rnkPct * 0.4, sk, r };
+          })
+          .sort((a, b) => b.score - a.score).slice(0, 8);
+        const rows = scored.map((e, i) => `<tr>
+          <td class="aw-rank">#${i + 1}</td>
+          <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
+          <td class="aw-stat">${e.sk ? (e.sk.driver + e.sk.prog) : '—'}</td>
+          <td class="aw-stat">${e.r ? 'Q' + e.r.rank : '—'}</td>
+          <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${Math.round(e.score*100)}%"></div><span>${Math.round(e.score*100)}%</span></td>
+        </tr>`).join('');
+        predHtml = `<div class="award-pred-section">
+          <div class="award-pred-title">Top performers (60% skills + 40% qual rank)</div>
+          <div class="table-wrap"><table class="award-table">
+            <thead><tr><th>#</th><th>Team</th><th>Skills</th><th>Qual</th><th>Score</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>
+        </div>`;
+      } else if (info.criteria === 'notebook') {
+        predHtml = `<div class="award-pred-note-block">Winner selected by judges from Engineering Notebook review and team interview — no performance threshold required.</div>`;
+      } else if (info.criteria === 'none') {
+        predHtml = `<div class="award-pred-note-block">Discretionary — determined by judges or event staff observation.</div>`;
+      }
+    }
+
+    const catCls = `award-cat-${info.cat}`;
+    return `
+      <div class="award-card ${catCls}${given ? ' award-given' : ''}">
+        <div class="award-card-header">
+          <span class="award-icon">${info.icon}</span>
+          <div class="award-card-title-block">
+            <div class="award-card-name">${esc(a?.title || title)}</div>
+            <div class="award-card-desc">${info.desc}</div>
+          </div>
+          ${given ? '<span class="award-given-badge">Awarded</span>' : '<span class="award-pending-badge">Pending</span>'}
+        </div>
+        ${quals}
+        ${winnerHtml}
+        ${predHtml}
+      </div>`;
+  }
+
+  // Build output: first render all API awards, then inject prediction context
+  let html = '';
+
+  // Sort by category priority then by API order
+  const CAT_PRIORITY = { excellence: 0, performance: 1, notebook: 2, special: 3, conduct: 4, other: 5 };
+  const sortedApiAwards = [...apiAwards].sort((a, b) => {
+    const ta = classifyAward(a.title), tb = classifyAward(b.title);
+    const ca = AWARD_INFO[ta]?.cat || 'other', cb = AWARD_INFO[tb]?.cat || 'other';
+    const pa = CAT_PRIORITY[ca] ?? 5, pb = CAT_PRIORITY[cb] ?? 5;
+    return pa !== pb ? pa - pb : (a.order || 0) - (b.order || 0);
+  });
+
+  if (!sortedApiAwards.length) {
+    // No awards data yet — show predictive cards for key award types
+    const previewTypes = ['excellence', 'champion', 'skills_champ', 'design', 'think', 'amaze', 'build', 'create', 'innovate', 'judges'];
+    html = previewTypes.map(type => renderAwardCard(type, null)).join('');
+    return `<div class="stats-section">
       <div class="section-title">Awards</div>
-      <p class="empty">No awards data available.</p>
+      <p class="sim-info">No awards have been announced yet — showing eligible teams based on current standings.</p>
+      <div class="awards-grid">${html}</div>
     </div>`;
-  const sorted = [...awards].sort((a, b) => (a.order || 0) - (b.order || 0));
-  const items = sorted.map(a => {
-    const winners = (a.teams || []).map(t => {
-      if (t.team?.name) return `<button class="team-link" data-num="${esc(t.team.name)}" style="font-size:.85rem">${esc(t.team.name)}</button>`;
-      if (t.person)     return `<span style="font-size:.85rem">${esc(t.person)}</span>`;
-      return '';
-    }).filter(Boolean).join(', ');
-    const quals = a.qualifications?.length
-      ? `<div class="award-qual">Qualifies for: ${esc(a.qualifications.join(', '))}</div>` : '';
-    return `<div class="award-item">
-      <div class="award-title">🏆 ${esc(a.title)}</div>
-      ${winners ? `<div class="award-winner">${winners}</div>` : ''}
-      ${quals}
-    </div>`;
-  }).join('');
-  return `
-    <div class="stats-section">
-      <div class="section-title">Awards (${awards.length})</div>
-      <div class="awards-list">${items}</div>
-    </div>`;
+  }
+
+  html = sortedApiAwards.map(a => renderAwardCard(classifyAward(a.title), a)).join('');
+  const givenCount = sortedApiAwards.filter(a => (a.teams || []).length > 0).length;
+  const pendingCount = sortedApiAwards.length - givenCount;
+  const statusNote = givenCount === sortedApiAwards.length
+    ? `All ${givenCount} award${givenCount !== 1 ? 's' : ''} have been announced.`
+    : pendingCount === sortedApiAwards.length
+    ? 'No awards announced yet — showing eligible teams based on current standings.'
+    : `${givenCount} awarded · ${pendingCount} pending`;
+
+  return `<div class="stats-section">
+    <div class="section-title">Awards (${sortedApiAwards.length})</div>
+    <p class="sim-info">${statusNote}</p>
+    <div class="awards-grid">${html}</div>
+  </div>`;
 }
 
 // ── Event Skills (grouped by team) ─────────────────────────────────────────
@@ -2273,6 +2994,7 @@ function buildRankingsCache(data) {
       wins: r.wins || 0, losses: r.losses || 0, ties: r.ties || 0,
       winRate: total > 0 ? (r.wins || 0) / total : 0.5,
       wp: r.wp || 0,
+      sp: r.sp || 0,
     };
   }
 }

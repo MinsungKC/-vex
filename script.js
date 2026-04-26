@@ -5,6 +5,16 @@ const ROUND_NAMES = { 1: 'Practice', 2: 'Qualifications', 3: 'Quarterfinals', 4:
 
 // RobotEvents uses score = -1 as a sentinel for "not yet played" — treat anything < 0 as unscored
 function isScored(score) { return typeof score === 'number' && score >= 0; }
+// Returns true when a match has been played and both alliances have real scores.
+// Checks m.started (set by the API when a match begins) as a stronger guard than score alone,
+// since some events pre-populate alliance scores with 0 before a match is played.
+function matchIsScored(m) {
+  const alliances = m.alliances || [];
+  if (alliances.length < 2) return false;
+  // If the API provides a started timestamp, require it to be non-null
+  if ('started' in m && m.started == null) return false;
+  return alliances.every(a => isScored(a.score));
+}
 
 // ── State ─────────────────────────────────────────────────────────────────
 let currentTeam        = null;
@@ -45,11 +55,20 @@ let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions
 
 // ── API helpers ────────────────────────────────────────────────────────────
 async function apiFetch(path) {
-  const res = await fetch(BASE + path, {
-    headers: { Authorization: `Bearer ${API_TOKEN}`, Accept: 'application/json' }
-  });
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(BASE + path, {
+      headers: { Authorization: `Bearer ${API_TOKEN}`, Accept: 'application/json' }
+    });
+    if (res.status === 429) {
+      // Respect Retry-After header (seconds), fallback to exponential backoff
+      const wait = parseInt(res.headers.get('Retry-After') || '0', 10) * 1000
+                   || Math.min(4000 * Math.pow(2, attempt), 64000);
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+    return res.json();
+  }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -702,7 +721,10 @@ async function loadSeasonOPR() {
 // ── Effective OPR: current event → season fallback → rankings/skills proxy ─
 function effectiveOPR(name) {
   const entry = cachedOPR[name];
-  if (entry?.opr != null && entry.opr > 0) return entry.opr;
+  // Only trust computed OPR if it's above a floor of 2 pts.
+  // Gaussian elimination can produce small positive artifacts for under-constrained teams;
+  // those would round to 0 in predictMatch and corrupt predictions.
+  if (entry?.opr != null && entry.opr >= 2) return entry.opr;
   const s = cachedSeasonOPR[name];
   if (s != null) {
     const val = typeof s === 'object' ? s.opr : s; // handle both old number and new {opr,ccwm} format
@@ -736,9 +758,7 @@ function effectiveOPR(name) {
 // When only OPR is available (no event data yet), falls back to OPR directly.
 function effectiveStrength(name) {
   const entry = cachedOPR[name];
-  if (entry?.opr > 0) {
-    // Blend: OPR anchors the magnitude, CCWM skews it.
-    // Weight: 55% OPR (keeps scores sensible) + 45% CCWM contribution
+  if (entry?.opr >= 2) {
     return Math.max(1, entry.opr * 0.55 + (entry.opr + entry.ccwm) * 0.45);
   }
   const s = cachedSeasonOPR[name];
@@ -756,7 +776,7 @@ function effectiveStrength(name) {
 // Used to calibrate Gaussian noise in the simulation.
 function eventScoreStdDev() {
   const scored = cachedEventMatches.filter(
-    m => m.round === 2 && (m.alliances || []).every(a => isScored(a.score))
+    m => m.round === 2 && matchIsScored(m)
   );
   if (scored.length < 4) return 15; // default: ±15 pts before enough data
   const scores = [];
@@ -864,7 +884,7 @@ function renderMatches(matches) {
       const blueTeamLinks = (blue.teams || []).map(t =>
         '<button class="team-link td-blue" data-num="' + esc(t.team?.name || '') + '">' + esc(t.team?.name || '?') + '</button>').join(' ');
 
-      const hasScore = isScored(red.score) && isScored(blue.score);
+      const hasScore = matchIsScored(m);
       const redWon   = hasScore && red.score  > blue.score;
       const blueWon  = hasScore && blue.score > red.score;
 
@@ -993,7 +1013,7 @@ function matchDetailHTML(m) {
     ...blueNames.map(n => ({ name: n, color: 'blue' })),
   ];
 
-  const hasScore = isScored(red.score) && isScored(blue.score);
+  const hasScore = matchIsScored(m);
   const pred = (showMatchPredictions || !hasScore) ? predictMatch(m) : null;
   const scoreStr = hasScore
     ? `<span class="td-red" style="font-weight:700">${red.score}</span>
@@ -1051,7 +1071,7 @@ function matchDetailHTML(m) {
 // This is more reliable than trusting r.wins/r.losses/r.ties from the API.
 function computeAWPRates() {
   const scored = cachedEventMatches.filter(
-    m => m.round === 2 && (m.alliances || []).every(a => isScored(a.score))
+    m => m.round === 2 && matchIsScored(m)
   );
 
   const baseWP = {}, played = {};
@@ -1108,7 +1128,7 @@ function runRankingSimulation(nSims, fromMatchNum = null) {
 
   // A match is "scored" if both alliances have a real score.
   const scoredNums = new Set(
-    quals.filter(m => (m.alliances || []).every(a => isScored(a.score))).map(m => m.matchnum)
+    quals.filter(m => matchIsScored(m)).map(m => m.matchnum)
   );
   // "Rewound" = the slider is pointing at a match that has already been played.
   // This lets the user replay from any past point — including when the whole event is over.
@@ -1329,7 +1349,7 @@ function renderSimMatchTable() {
     const red  = alliances.find(a => a.color === 'red')  || alliances[0] || {};
     const blue = alliances.find(a => a.color === 'blue') || alliances[1] || {};
     const pred = predictMatch(m);
-    const isPlayed = isScored(red.score) && isScored(blue.score);
+    const isPlayed = matchIsScored(m);
 
     const redTeamStr  = (red.teams  || []).map(t => '<button class="team-link sim-team-link" data-num="' + esc(t.team?.name || '') + '">' + esc(t.team?.name || '?') + '</button>').join(' ');
     const blueTeamStr = (blue.teams || []).map(t => '<button class="team-link sim-team-link" data-num="' + esc(t.team?.name || '') + '">' + esc(t.team?.name || '?') + '</button>').join(' ');
@@ -1362,7 +1382,7 @@ function renderSimMatchTable() {
 function renderSimTab() {
   const quals = cachedEventMatches.filter(m => m.round === 2);
   const unscoredCount = quals.filter(m =>
-    !(m.alliances || []).every(a => isScored(a.score))
+    !matchIsScored(m)
   ).length;
 
   if (!quals.length && !Object.keys(cachedEventRankings).length) {
@@ -1372,27 +1392,28 @@ function renderSimTab() {
   const simOptions = [10, 100, 500, 1000];
   const defaultSim = 100;
 
-  // Build sorted match list for the slider
-  const sortedQuals = quals.slice().sort((a, b) => a.matchnum - b.matchnum);
-  const matchNums   = sortedQuals.map(m => m.matchnum);
-  const minMatch    = matchNums[0] || 1;
-  const maxMatch    = matchNums[matchNums.length - 1] || 1;
-  // Default start = first unscored match.
-  // If all matches are scored we use maxMatch+1 (one past the end) as a sentinel:
-  //   scoredNums.has(maxMatch+1) === false → isRewound=false → toSim=[] → shows current final standings.
-  const firstUnscored = sortedQuals.find(m => !(m.alliances || []).every(a => isScored(a.score)));
-  const sliderMax     = maxMatch + 1;          // extra sentinel position for "current/end"
-  const defaultStart  = firstUnscored ? firstUnscored.matchnum : sliderMax;
+  // Build sorted match list for the slider — only scored matches are valid rewind points
+  const sortedQuals   = quals.slice().sort((a, b) => a.matchnum - b.matchnum);
+  const matchNums     = sortedQuals.map(m => m.matchnum);
+  const minMatch      = matchNums[0] || 1;
+  const scoredNums    = new Set(
+    sortedQuals.filter(m => matchIsScored(m)).map(m => m.matchnum)
+  );
+  const scoredSorted  = matchNums.filter(n => scoredNums.has(n));
+  const lastScoredNum = scoredSorted[scoredSorted.length - 1] ?? minMatch;
+  // +1 sentinel = "End (current)": simulate only remaining unscored matches from now
+  const sliderMax    = lastScoredNum + 1;
+  const defaultStart = sliderMax; // always default to current state
 
   function simSliderLabel(v) {
-    return +v > maxMatch ? 'End (current)' : 'Q-' + v;
+    return +v > lastScoredNum ? 'End (current)' : 'Q-' + v;
   }
 
   const sliderHtml =
     '<div class="sim-slider-row">' +
     '<span class="sim-label">Simulate from:</span>' +
     '<input type="range" id="sim-start-slider" class="sim-slider" ' +
-    'min="' + minMatch + '" max="' + sliderMax + '" value="' + defaultStart + '" step="1" />' +
+    'min="' + (scoredSorted[0] ?? minMatch) + '" max="' + sliderMax + '" value="' + defaultStart + '" step="1" />' +
     '<span class="sim-slider-label" id="sim-slider-label">' + simSliderLabel(defaultStart) + '</span>' +
     '</div>';
 
@@ -1523,7 +1544,9 @@ const COUNTRY_COORDS = {
 const PROGRAM_IDS = { all: null, v5rc: 1, viqrc: 4, vexu: 41 };
 
 let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, markerLayer: null, heatLayer: null, heatmap: false, sourceView: 'view-search' };
-let _mapLoadGen = 0; // incremented on each loadMapData call to cancel stale batches
+let _mapLoadGen = 0;
+const _seasonIdCache  = {};   // programId -> seasonId (in-memory, avoids repeated API calls)
+const _teamsByProgram = {};   // programId -> slimTeam[] (in-memory per-program cache)
 
 function destroyLeafletMap() {
   if (mapState.leafletMap) {
@@ -1596,7 +1619,7 @@ function buildDots(teams) {
     }
     if (lat != null && lon != null) {
       const key = lat.toFixed(2) + ',' + lon.toFixed(2);
-      if (!dots[key]) dots[key] = { lat, lon, city: t.location?.city || '', teams: [] };
+      if (!dots[key]) dots[key] = { lat, lon, city: t.location?.city || '', region: t.location?.region || '', country: t.location?.country || '', teams: [] };
       dots[key].teams.push(teamInfo);
     }
     if (country) {
@@ -1640,9 +1663,10 @@ function updateMapOverlay(teams) {
         radius, fillColor: `hsl(${hue},75%,45%)`, color: '#fff',
         weight: 1, opacity: 0.9, fillOpacity: 0.8,
       }).addTo(mapState.markerLayer);
+      const dotLocLabel = [dot.city, dot.region, dot.country].filter(Boolean).join(', ') || 'this location';
       const tipLabel = count === 1
-        ? '<strong>' + esc(dot.teams[0].number) + '</strong>'
-        : '<strong>' + count + ' teams</strong> at this location';
+        ? '<strong>' + esc(dot.teams[0].number) + '</strong> · ' + esc(dotLocLabel)
+        : '<strong>' + count + ' teams</strong> · ' + esc(dotLocLabel);
       marker.bindTooltip(tipLabel, { direction: 'top', offset: [0, -4] });
       marker.on('click', () => showMapDotsPanel(dot));
     }
@@ -1718,12 +1742,13 @@ async function openMapView(eventId) {
 }
 
 async function getActiveSeasonId(programId) {
+  if (_seasonIdCache[programId] !== undefined) return _seasonIdCache[programId];
   try {
     const json = await apiFetch(`/seasons?program[]=${programId}&active=true&per_page=1`);
-    if (json.data?.length) return json.data[0].id;
+    if (json.data?.length) return (_seasonIdCache[programId] = json.data[0].id);
     const fallback = await apiFetch(`/seasons?program[]=${programId}&per_page=1`);
-    return fallback.data?.[0]?.id || null;
-  } catch { return null; }
+    return (_seasonIdCache[programId] = fallback.data?.[0]?.id || null);
+  } catch { return (_seasonIdCache[programId] = null); }
 }
 
 // Slim down a team object to only the fields the map needs, to keep the cache small.
@@ -1733,111 +1758,172 @@ function slimTeam(t) {
     name:     t.name,
     grade:    t.grade,
     program:  t.program?.id,
-    location: t.location ? { country: t.location.country, coordinates: t.location.coordinates } : null,
+    location: t.location ? { country: t.location.country, region: t.location.region, city: t.location.city, coordinates: t.location.coordinates } : null,
   };
 }
 
-// onBatch(newTeams) is called with each page's teams as they arrive.
-async function fetchMapTeams(url, onBatch) {
-  const cacheKey = 'mapteams3_' + url.replace(/[^a-z0-9]/gi, '_').slice(-80);
+// ── Per-program localStorage cache (24 h TTL) ─────────────────────────────
+function _progCacheKey(pid) { return `vexmap_prog_${pid}`; }
+function _readProgCache(pid) {
   try {
-    const raw = localStorage.getItem(cacheKey);
-    if (raw) {
-      const { ts, data } = JSON.parse(raw);
-      // Only trust cache entries with a plausible number of teams
-      if (Date.now() - ts < 24 * 60 * 60 * 1000 && data.length > 50) {
-        onBatch?.(data);
-        return data;
-      }
-    }
+    const raw = localStorage.getItem(_progCacheKey(pid));
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    if (Date.now() - ts < 24 * 60 * 60 * 1000 && Array.isArray(data) && data.length > 0) return data;
   } catch (_) {}
+  return null;
+}
+function _writeProgCache(pid, data) {
+  const payload = { ts: Date.now(), data };
+  try {
+    localStorage.setItem(_progCacheKey(pid), JSON.stringify(payload));
+  } catch (e) {
+    // Quota exceeded — retry without city/region to shrink the payload
+    try {
+      const slim = data.map(t => ({
+        ...t,
+        location: t.location
+          ? { country: t.location.country, coordinates: t.location.coordinates }
+          : null,
+      }));
+      localStorage.setItem(_progCacheKey(pid), JSON.stringify({ ts: Date.now(), data: slim }));
+    } catch (_) {
+      console.warn('[map] localStorage quota exceeded for program', pid, '— map cache disabled');
+    }
+  }
+}
 
+// Pure fetcher — no caching. Calls onBatch(batch) as each page arrives.
+// apiFetch already retries 429 automatically; this retries other transient errors per page.
+async function fetchMapTeams(url, onBatch) {
   const sep = url.includes('?') ? '&' : '?';
 
-  // Fetch page 1 to learn last_page, then fire the rest in parallel
   const first = await apiFetch(`${url}${sep}page=1&per_page=250`);
   if (!first.data?.length) return [];
   const all = first.data.map(slimTeam);
   const lastPage = first.meta?.last_page ?? 1;
-  onBatch?.(all.slice()); // first batch
+  onBatch?.(all.slice());
 
-  let failCount = 0;
   if (lastPage > 1) {
     const pages = Array.from({ length: lastPage - 1 }, (_, i) => i + 2);
     await promisePool(pages.map(p => async () => {
-      try {
-        const json = await apiFetch(`${url}${sep}page=${p}&per_page=250`);
-        if (json.data?.length) {
-          const batch = json.data.map(slimTeam);
-          all.push(...batch);
-          onBatch?.(batch);
+      // Retry each page up to 4 times with backoff for transient errors
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const json = await apiFetch(`${url}${sep}page=${p}&per_page=250`);
+          if (json.data?.length) {
+            const batch = json.data.map(slimTeam);
+            all.push(...batch);
+            onBatch?.(batch);
+          }
+          break;
+        } catch (err) {
+          if (attempt >= 4) break; // give up on this page after 4 retries
+          await sleep(Math.min(2000 * Math.pow(2, attempt), 30000));
         }
-      } catch (_) { failCount++; }
-    }), 12);
-  }
-
-  // Only cache if we got a complete (or near-complete) result
-  if (failCount === 0) {
-    try { localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), data: all })); } catch (_) {}
+      }
+    }), 8);
   }
 
   return all;
 }
 
 async function loadMapData() {
-  const gen = ++_mapLoadGen; // cancel any in-flight batches from a previous load
-  destroyLeafletMap();
+  const gen = ++_mapLoadGen;
   const container = document.getElementById('map-container');
-  container.innerHTML = '<p class="empty" style="padding:20px">Loading…</p>';
   mapState.grade = mapState.grade || 'all';
 
-  const accTeams = [];
-  let renderTimer = null;
+  // ── Event-specific map (no per-program cache) ──────────────────────────────
+  if (mapState.eventId) {
+    destroyLeafletMap();
+    container.innerHTML = '<p class="empty" style="padding:20px">Loading…</p>';
+    try {
+      const teams = await fetchAllPages(`/events/${mapState.eventId}/teams`);
+      if (gen !== _mapLoadGen) return;
+      mapState.allTeams = teams;
+      initLeafletMap();
+      updateMapOverlay(teams);
+    } catch (err) {
+      if (!mapState.leafletMap) container.innerHTML = '<p class="empty">Error: ' + esc(err.message) + '</p>';
+    }
+    return;
+  }
 
+  // ── Global map — use per-program in-memory cache ───────────────────────────
+  const programsNeeded = mapState.programId ? [mapState.programId] : [1, 4, 41];
+
+  // Warm in-memory cache from localStorage for any program not yet loaded this session
+  for (const pid of programsNeeded) {
+    if (!_teamsByProgram[pid]) {
+      const cached = _readProgCache(pid);
+      if (cached) _teamsByProgram[pid] = cached;
+    }
+  }
+
+  const missing = programsNeeded.filter(pid => !_teamsByProgram[pid]);
+
+  // Everything already in memory → instant re-render, no network at all
+  if (missing.length === 0) {
+    const allTeams = programsNeeded.flatMap(pid => _teamsByProgram[pid]);
+    mapState.allTeams = allTeams;
+    initLeafletMap();
+    updateMapOverlay(allTeams);
+    return;
+  }
+
+  // Seed accTeams with any programs already cached so they appear immediately
+  const accTeams = programsNeeded
+    .filter(pid => _teamsByProgram[pid])
+    .flatMap(pid => _teamsByProgram[pid]);
+
+  // Only destroy/show spinner if we have no existing map content to show
+  if (!mapState.leafletMap) {
+    if (accTeams.length === 0) {
+      container.innerHTML = '<p class="empty" style="padding:20px">Loading…</p>';
+    }
+  } else if (accTeams.length > 0) {
+    // Map is live — immediately show what's cached while we fetch the rest
+    updateMapOverlay(accTeams);
+  }
+
+  let renderTimer = null;
   function scheduleOverlayUpdate() {
     clearTimeout(renderTimer);
     renderTimer = setTimeout(() => {
-      if (gen !== _mapLoadGen) return; // superseded
+      if (gen !== _mapLoadGen) return;
       initLeafletMap();
       mapState.allTeams = accTeams.slice();
       updateMapOverlay(accTeams);
     }, 250);
   }
 
-  function onBatch(newTeams) {
-    if (gen !== _mapLoadGen) return; // superseded
-    accTeams.push(...newTeams);
-    scheduleOverlayUpdate();
-  }
-
   try {
-    if (mapState.eventId) {
-      const teams = await fetchAllPages(`/events/${mapState.eventId}/teams`);
-      accTeams.push(...teams);
-    } else if (mapState.programId) {
-      const seasonId = await getActiveSeasonId(mapState.programId);
-      const url = `/teams?myTeams=false&registered=true&program[]=${mapState.programId}` +
+    await Promise.all(missing.map(async pid => {
+      const seasonId = await getActiveSeasonId(pid);
+      const url = `/teams?myTeams=false&registered=true&program[]=${pid}` +
         (seasonId ? `&season[]=${seasonId}` : '');
-      await fetchMapTeams(url, onBatch);
-    } else {
-      const programIds = [1, 4, 41];
-      await Promise.all(programIds.map(async pid => {
-        const seasonId = await getActiveSeasonId(pid);
-        const url = `/teams?myTeams=false&registered=true&program[]=${pid}` +
-          (seasonId ? `&season[]=${seasonId}` : '');
-        await fetchMapTeams(url, onBatch);
-      }));
-    }
-    // Final render (clears any pending debounce)
+      // fetchMapTeams returns the complete array; use it for the cache write
+      // so we don't depend on onBatch accumulation being intact
+      const fetched = await fetchMapTeams(url, batch => {
+        if (gen !== _mapLoadGen) return;
+        accTeams.push(...batch);
+        scheduleOverlayUpdate();
+      });
+      // Commit full dataset to in-memory cache and persist to localStorage
+      if (gen === _mapLoadGen && fetched.length > 0) {
+        _teamsByProgram[pid] = fetched;
+        _writeProgCache(pid, fetched);
+      }
+    }));
+
     clearTimeout(renderTimer);
+    if (gen !== _mapLoadGen) return;
     initLeafletMap();
     mapState.allTeams = accTeams.slice();
     updateMapOverlay(accTeams);
   } catch (err) {
     clearTimeout(renderTimer);
-    if (!mapState.leafletMap) {
-      container.innerHTML = '<p class="empty">Error loading team data: ' + esc(err.message) + '</p>';
-    }
+    if (!mapState.leafletMap) container.innerHTML = '<p class="empty">Error: ' + esc(err.message) + '</p>';
   }
 }
 
@@ -1858,10 +1944,11 @@ function showMapDotsPanel(dot) {
   panel.classList.remove('hidden');
   const teams = dot.teams;
   const inEvent = !!mapState.eventId;
-  const country = teams[0]?.country || '';
-  const city    = dot.city || '';
+  const city    = dot.city    || '';
+  const region  = dot.region  || '';
+  const country = dot.country || teams[0]?.country || '';
 
-  const locationLabel = [city, country].filter(Boolean).join(', ') || 'this location';
+  const locationLabel = [city, region, country].filter(Boolean).join(', ') || 'this location';
 
   let headerHtml =
     '<div class="map-panel-header">' +
@@ -1938,7 +2025,7 @@ function showMapDotsPanel(dot) {
 function computeOPR(qualMatches) {
   // Only use scored matches; sort oldest→newest so decay weights are correct
   const scored = qualMatches
-    .filter(m => (m.alliances || []).every(a => isScored(a.score)))
+    .filter(m => matchIsScored(m))
     .sort((a, b) => a.matchnum - b.matchnum);
 
   const teamNames = [];
@@ -3027,7 +3114,7 @@ function computePredictionHistory(targetMatch) {
 
   const prev = cachedEventMatches.filter(m =>
     m.round === 2 && m.matchnum < targetMatch.matchnum &&
-    (m.alliances || []).every(a => isScored(a.score))
+    matchIsScored(m)
   ).sort((a, b) => a.matchnum - b.matchnum);
 
   if (prev.length < 2) return [];
@@ -3119,7 +3206,7 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
     const al   = match.alliances || [];
     const mine = al.find(a => (a.teams || []).some(t => t.team?.name === teamNumber));
     const opp  = al.find(a => !(a.teams || []).some(t => t.team?.name === teamNumber));
-    if (!mine || !opp || !isScored(mine.score) || !isScored(opp.score)) continue;
+    if (!mine || !opp || !matchIsScored(match)) continue;
     if (mine.score > opp.score) wins++;
     else if (mine.score < opp.score) losses++;
     else ties++;
@@ -3130,7 +3217,7 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
   for (const match of teamMatches) {
     const al   = match.alliances || [];
     const mine = al.find(a => (a.teams || []).some(t => t.team?.name === teamNumber));
-    if (!mine || isScored(mine.score)) continue;
+    if (!mine || matchIsScored(match)) continue;
     const pred = predictMatch(match);
     if (pred) { predCount++; if (pred.winner === mine.color) predWins++; }
   }
@@ -3171,7 +3258,7 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
     (a.round - b.round) || (a.instance - b.instance) || (a.matchnum - b.matchnum));
 
   const nextUnscored = sorted.find(m =>
-    m.round === 2 && !(m.alliances || []).every(a => isScored(a.score)));
+    m.round === 2 && !matchIsScored(m));
   const graphSection = nextUnscored ? renderPredEvolutionChart(computePredictionHistory(nextUnscored)) : '';
 
   // ── Match schedule table
@@ -3202,7 +3289,7 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
       : match.round === 1 ? 'P' + match.matchnum
       : (ROUND_NAMES[match.round] || 'M') + ' ' + match.instance + '-' + match.matchnum;
 
-    const hasScore = isScored(mine.score) && isScored(opp?.score);
+    const hasScore = matchIsScored(match);
     const pred = predictMatch(match);
     let scoreCell, resultCell;
 

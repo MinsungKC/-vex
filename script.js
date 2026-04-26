@@ -97,7 +97,7 @@ async function fetchAllPages(path) {
 }
 
 // ── View routing ───────────────────────────────────────────────────────────
-const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map'];
+const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings'];
 function showView(id) {
   VIEWS.forEach(v => document.getElementById(v).classList.toggle('hidden', v !== id));
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -110,6 +110,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.classList.add('active');
     const which = tab.dataset.tab;
     if (which === 'map') { openMapView(); return; }
+    if (which === 'standings') { openStandingsView(); return; }
     document.getElementById('panel-team').classList.toggle('hidden', which !== 'team');
     document.getElementById('panel-event').classList.toggle('hidden', which !== 'event');
     if (which === 'event') onEventTabActivated();
@@ -125,6 +126,13 @@ document.getElementById('back-to-seasons').addEventListener('click', () => {
 });
 document.getElementById('back-to-event-from-team').addEventListener('click', () => showView('view-event'));
 document.getElementById('back-from-map').addEventListener('click', () => showView(mapState.sourceView));
+document.getElementById('back-from-standings').addEventListener('click', () => {
+  showView('view-search');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-tab="team"]')?.classList.add('active');
+  document.getElementById('panel-team').classList.remove('hidden');
+  document.getElementById('panel-event').classList.add('hidden');
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TEAM SEARCH
@@ -460,7 +468,7 @@ function attachMatchTabListeners(el) {
   }
 }
 
-// Fetch prior-season award history for a list of team names (by number string like "2496V").
+// Fetch prior-season award history for a list of team names (by number string like "8838E").
 // Returns { teamName: rawScore } where rawScore is the sum of PRIOR_AWARD_WEIGHTS for each award
 // the team won at OTHER events this season.
 async function loadPriorAwardScores(teamNames) {
@@ -1481,6 +1489,466 @@ function renderSimResults(results) {
     '<thead><tr><th>Pred.</th><th>Team</th><th>Now</th><th>Δ</th>' +
     '<th>Record</th><th>Avg WP</th><th>Distribution</th></tr></thead>' +
     '<tbody>' + rows + '</tbody></table></div>';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STANDINGS
+// ═══════════════════════════════════════════════════════════════════════════
+
+let standingsState = {
+  programId: 1,
+  seasonId: null,
+  sort: 'combined',   // 'combined' | 'driver' | 'programming' | 'trueskill'
+  grade: 'all',
+  country: '',
+  region: '',
+  data: null,         // processed team array for current program+season
+  page: 0,
+};
+const STANDINGS_PAGE = 100;
+
+// ── Standings cache helpers ────────────────────────────────────────────────
+// Processed final result: 12h TTL
+function standingsCacheKey(pid, sid) { return `vexskills2_${pid}_${sid}`; }
+function readStandingsCache(pid, sid) {
+  try {
+    const raw = localStorage.getItem(standingsCacheKey(pid, sid));
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    if (Date.now() - ts < 12 * 60 * 60 * 1000) return data;
+  } catch (_) {}
+  return null;
+}
+function writeStandingsCache(pid, sid, data) {
+  try {
+    localStorage.setItem(standingsCacheKey(pid, sid), JSON.stringify({ ts: Date.now(), data }));
+  } catch (_) {
+    try {
+      const slim = data.map(t => { const c = { ...t }; delete c.region; delete c.city; return c; });
+      localStorage.setItem(standingsCacheKey(pid, sid), JSON.stringify({ ts: Date.now(), data: slim }));
+    } catch (_2) {}
+  }
+}
+
+// Event list: 1h TTL
+function evListCacheKey(pid, sid) { return `vexevlist_${pid}_${sid}`; }
+function readEvListCache(pid, sid) {
+  try {
+    const raw = localStorage.getItem(evListCacheKey(pid, sid));
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    if (Date.now() - ts < 60 * 60 * 1000) return data;
+  } catch (_) {}
+  return null;
+}
+function writeEvListCache(pid, sid, data) {
+  try { localStorage.setItem(evListCacheKey(pid, sid), JSON.stringify({ ts: Date.now(), data })); } catch (_) {}
+}
+
+// Partial progress cache: aggregated byTeam + set of already-fetched event IDs.
+// No TTL — any saved progress is better than starting over.
+// Written every 50 events; deleted when the final cache is written.
+function partialCacheKey(pid, sid) { return `vexskills_partial_${pid}_${sid}`; }
+function readPartialCache(pid, sid) {
+  try { return JSON.parse(localStorage.getItem(partialCacheKey(pid, sid)) || 'null'); } catch (_) { return null; }
+}
+function writePartialCache(pid, sid, byTeam, fetchedIds) {
+  try {
+    localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify({ byTeam, fetchedIds: [...fetchedIds] }));
+  } catch (_) {
+    try {
+      // Quota fallback: drop city/region to shrink payload
+      const slim = {};
+      for (const [k, t] of Object.entries(byTeam)) { slim[k] = { ...t }; delete slim[k].city; delete slim[k].region; }
+      localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify({ byTeam: slim, fetchedIds: [...fetchedIds] }));
+    } catch (_2) {}
+  }
+}
+
+// Merge raw /events/{id}/skills entries into a byTeam accumulator (mutates in place).
+function mergeSkillsInto(byTeam, entries) {
+  for (const s of entries) {
+    const num = s.team?.name;
+    if (!num) continue;
+    if (!byTeam[num]) {
+      byTeam[num] = {
+        number: num, grade: s.team?.grade || '',
+        programId: s.team?.program?.id,
+        country: s.team?.location?.country || '',
+        region:  s.team?.location?.region  || '',
+        city:    s.team?.location?.city    || '',
+        driver: 0, driverStop: null, programming: 0, programmingStop: null,
+      };
+    }
+    const t = byTeam[num];
+    if (s.type === 'driver'      && s.score > t.driver)      { t.driver      = s.score; t.driverStop      = s.stop_time ?? null; }
+    if (s.type === 'programming' && s.score > t.programming) { t.programming = s.score; t.programmingStop = s.stop_time ?? null; }
+  }
+}
+
+// Convert byTeam accumulator to the final sorted array.
+function buildSkillsResult(byTeam) {
+  return Object.values(byTeam).map(t => ({
+    ...t,
+    combined:  t.driver + t.programming,
+    trueSkill: t.driver + t.programming +
+      (t.driver > 0 && t.programming > 0 ? Math.min(t.driver, t.programming) * 0.15 : 0),
+  }));
+}
+
+// Fill in missing grade / location fields from the map team lookup.
+// teamsByNum is a plain object: { "2397A": slimTeam, ... }
+function enrichFromTeamData(byTeam, teamsByNum) {
+  for (const [num, t] of Object.entries(byTeam)) {
+    const m = teamsByNum[num];
+    if (!m) continue;
+    if (!t.grade   && m.grade)              t.grade   = m.grade;
+    if (!t.country && m.location?.country)  t.country = m.location.country;
+    if (!t.region  && m.location?.region)   t.region  = m.location.region;
+    if (!t.city    && m.location?.city)     t.city    = m.location.city;
+  }
+}
+
+// Fetch skills for a season by scanning every event.
+// Calls onUpdate(byTeam, done, total) progressively as events are processed.
+// Saves partial progress to localStorage every 50 events so a reload can resume.
+async function fetchSkillsStandings(pid, sid, onUpdate) {
+  // Final 12h cache → instant return
+  const cached = readStandingsCache(pid, sid);
+  if (cached) return cached;
+
+  // Event list (1h cache)
+  onUpdate?.(null, 0, 0);
+  let evList = readEvListCache(pid, sid);
+  if (!evList) {
+    const evData = await fetchAllPages(`/events?season[]=${sid}&program[]=${pid}&per_page=250`);
+    evList = evData.map(e => ({ id: e.id }));
+    writeEvListCache(pid, sid, evList);
+  }
+  const total = evList.length;
+
+  // Restore partial progress from a previous run
+  const partial   = readPartialCache(pid, sid);
+  const byTeam    = partial?.byTeam    ? { ...partial.byTeam } : {};
+  const fetchedIds = new Set(partial?.fetchedIds || []);
+  let done = fetchedIds.size;
+
+  // Events not yet fetched
+  const remaining = evList.filter(ev => !fetchedIds.has(ev.id));
+
+  // Emit initial state immediately (re-renders table from cached partial progress)
+  if (done > 0) onUpdate?.(byTeam, done, total);
+
+  let renderTimer = null;
+  let lastSave    = done;
+
+  function scheduleUpdate() {
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => {
+      onUpdate?.(byTeam, done, total);
+      // Persist partial progress every 50 new events
+      if (done - lastSave >= 50) {
+        writePartialCache(pid, sid, byTeam, fetchedIds);
+        lastSave = done;
+      }
+    }, 250);
+  }
+
+  await promisePool(remaining.map(ev => async () => {
+    try {
+      const entries = await fetchAllPages(`/events/${ev.id}/skills`);
+      mergeSkillsInto(byTeam, entries);
+    } catch (_) { /* skip failed event */ }
+    fetchedIds.add(ev.id);
+    done++;
+    scheduleUpdate();
+  }), 8);
+
+  clearTimeout(renderTimer);
+
+  // Write final cache and clean up partial
+  const result = buildSkillsResult(byTeam);
+  writeStandingsCache(pid, sid, result);
+  try { localStorage.removeItem(partialCacheKey(pid, sid)); } catch (_) {}
+
+  return result;
+}
+
+function applyStandingsFilters(data) {
+  const { grade, country, region, sort } = standingsState;
+  let out = data;
+  if (grade   !== 'all' && grade)   out = out.filter(t => t.grade   === grade);
+  if (country)                      out = out.filter(t => t.country === country);
+  if (region)                       out = out.filter(t => t.region  === region);
+  const key = sort === 'driver' ? 'driver' : sort === 'programming' ? 'programming' : sort === 'trueskill' ? 'trueSkill' : 'combined';
+  out = [...out].sort((a, b) => b[key] - a[key] || b.combined - a.combined);
+  return out;
+}
+
+function setStandingsStatus(msg, done, total) {
+  const el = document.getElementById('standings-status');
+  if (!el) return;
+  if (!msg) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.classList.remove('hidden');
+  const bar = (done != null && total > 0)
+    ? '<div class="st-progress-wrap"><div class="st-progress-bar" style="width:' + Math.round(done / total * 100) + '%"></div></div>'
+    : '';
+  el.innerHTML = '<span>' + esc(msg) + '</span>' + bar;
+}
+
+function renderStandingsFilters(data) {
+  const el = document.getElementById('standings-filters');
+  if (!el) return;
+
+  // Build unique sorted country list from current data
+  const countries = [...new Set(data.map(t => t.country).filter(Boolean))].sort();
+  const regions   = standingsState.country
+    ? [...new Set(data.filter(t => t.country === standingsState.country).map(t => t.region).filter(Boolean))].sort()
+    : [];
+
+  const prog = standingsState.programId;
+  const sel = (val, cur) => val === cur ? ' selected' : '';
+
+  el.innerHTML =
+    '<div class="standings-filter-bar">' +
+    // Program
+    '<select class="map-filter-select" id="st-prog">' +
+    '<option value="1"'  + sel(1,  prog) + '>V5RC</option>' +
+    '<option value="4"'  + sel(4,  prog) + '>VIQRC</option>' +
+    '<option value="41"' + sel(41, prog) + '>VEXU</option>' +
+    '</select>' +
+    // Sort
+    '<select class="map-filter-select" id="st-sort">' +
+    '<option value="combined"'    + sel('combined',    standingsState.sort) + '>Combined</option>' +
+    '<option value="driver"'      + sel('driver',      standingsState.sort) + '>Driver Skills</option>' +
+    '<option value="programming"' + sel('programming', standingsState.sort) + '>Programming Skills</option>' +
+    '<option value="trueskill"'   + sel('trueskill',   standingsState.sort) + '>TrueSkill</option>' +
+    '</select>' +
+    // Grade
+    '<select class="map-filter-select" id="st-grade">' +
+    '<option value="all"'           + sel('all',           standingsState.grade) + '>All Grades</option>' +
+    '<option value="Middle School"' + sel('Middle School', standingsState.grade) + '>Middle School</option>' +
+    '<option value="High School"'   + sel('High School',   standingsState.grade) + '>High School</option>' +
+    '<option value="College"'       + sel('College',       standingsState.grade) + '>College</option>' +
+    '</select>' +
+    // Country
+    '<select class="map-filter-select" id="st-country">' +
+    '<option value="">All Countries</option>' +
+    countries.map(c => '<option value="' + esc(c) + '"' + (c === standingsState.country ? ' selected' : '') + '>' + esc(c) + '</option>').join('') +
+    '</select>' +
+    // Region (only shown when country selected)
+    (regions.length ? '<select class="map-filter-select" id="st-region">' +
+      '<option value="">All Regions</option>' +
+      regions.map(r => '<option value="' + esc(r) + '"' + (r === standingsState.region ? ' selected' : '') + '>' + esc(r) + '</option>').join('') +
+      '</select>' : '<select class="map-filter-select" id="st-region" style="display:none"><option value=""></option></select>') +
+    // Cache info
+    '<span class="st-cache-note" id="st-cache-note"></span>' +
+    '<button class="map-toggle-btn" id="st-refresh" title="Force refresh from API">Refresh</button>' +
+    '</div>';
+
+  document.getElementById('st-prog').addEventListener('change', e => {
+    standingsState.programId = +e.target.value;
+    standingsState.country = ''; standingsState.region = ''; standingsState.page = 0;
+    loadStandingsData();
+  });
+  document.getElementById('st-sort').addEventListener('change', e => {
+    standingsState.sort = e.target.value; standingsState.page = 0;
+    renderStandingsTable(applyStandingsFilters(standingsState.data));
+  });
+  document.getElementById('st-grade').addEventListener('change', e => {
+    standingsState.grade = e.target.value; standingsState.page = 0;
+    renderStandingsTable(applyStandingsFilters(standingsState.data));
+  });
+  document.getElementById('st-country').addEventListener('change', e => {
+    standingsState.country = e.target.value; standingsState.region = ''; standingsState.page = 0;
+    renderStandingsFilters(standingsState.data);
+    renderStandingsTable(applyStandingsFilters(standingsState.data));
+  });
+  document.getElementById('st-region').addEventListener('change', e => {
+    standingsState.region = e.target.value; standingsState.page = 0;
+    renderStandingsTable(applyStandingsFilters(standingsState.data));
+  });
+  document.getElementById('st-refresh').addEventListener('click', () => {
+    if (standingsState.seasonId)
+      localStorage.removeItem(standingsCacheKey(standingsState.programId, standingsState.seasonId));
+    standingsState.data = null;
+    loadStandingsData();
+  });
+}
+
+function renderStandingsTable(filtered) {
+  const el = document.getElementById('standings-content');
+  if (!el) return;
+
+  const sort = standingsState.sort;
+  const isTS = sort === 'trueskill';
+  const page = standingsState.page;
+  const slice = filtered.slice(0, (page + 1) * STANDINGS_PAGE);
+  const hasMore = filtered.length > slice.length;
+
+  const stopFmt = s => (s != null && s > 0) ? s + 's' : '—';
+  const scoreCell = (score, stop, highlight) =>
+    '<td class="st-score' + (highlight ? ' st-score-hi' : '') + '">' +
+    (score > 0 ? score : '<span class="td-score-muted">—</span>') +
+    (score > 0 && stop ? '<span class="st-stop"> ' + stopFmt(stop) + '</span>' : '') +
+    '</td>';
+
+  let rows = '';
+  slice.forEach((t, i) => {
+    const globalRank = i + 1;
+    const loc = [t.city, t.region, t.country].filter(Boolean).join(', ') || '—';
+    rows +=
+      '<tr>' +
+      '<td class="st-rank">' + globalRank + '</td>' +
+      '<td><button class="team-link" data-num="' + esc(t.number) + '">' + esc(t.number) + '</button></td>' +
+      '<td class="td-score-muted" style="font-size:.8rem">' + esc(t.grade || '—') + '</td>' +
+      '<td class="td-score-muted" style="font-size:.75rem;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(loc) + '</td>' +
+      scoreCell(t.combined,     null,             sort === 'combined'    || isTS) +
+      scoreCell(t.driver,       t.driverStop,     sort === 'driver') +
+      scoreCell(t.programming,  t.programmingStop, sort === 'programming') +
+      (isTS ? '<td class="st-score st-score-hi">' + t.trueSkill.toFixed(0) + '</td>' : '') +
+      '</tr>';
+  });
+
+  el.innerHTML =
+    '<div class="st-summary">Showing <strong>' + slice.length + '</strong> of <strong>' + filtered.length + '</strong> teams' +
+    (filtered.length !== standingsState.data?.length ? ' (filtered from ' + standingsState.data.length + ' total)' : '') + '</div>' +
+    '<div class="table-wrap"><table class="standings-table">' +
+    '<thead><tr>' +
+    '<th>#</th><th>Team</th><th>Grade</th><th>Location</th>' +
+    '<th class="' + (sort === 'combined' || isTS ? 'th-sorted' : '') + '">Combined</th>' +
+    '<th class="' + (sort === 'driver'          ? 'th-sorted' : '') + '">Driver</th>' +
+    '<th class="' + (sort === 'programming'     ? 'th-sorted' : '') + '">Programming</th>' +
+    (isTS ? '<th class="th-sorted">TrueSkill</th>' : '') +
+    '</tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table></div>' +
+    (hasMore ? '<button class="btn-load-more" id="st-load-more">Load more (' + (filtered.length - slice.length) + ' remaining)</button>' : '');
+
+  el.querySelectorAll('.team-link').forEach(btn => {
+    btn.addEventListener('click', () => searchByTeam(btn.dataset.num));
+  });
+  document.getElementById('st-load-more')?.addEventListener('click', () => {
+    standingsState.page++;
+    renderStandingsTable(filtered);
+  });
+}
+
+async function loadStandingsData() {
+  const pid = standingsState.programId;
+  setStandingsStatus('Loading season info…');
+
+  let sid = standingsState.seasonId;
+  if (!sid || standingsState._lastPid !== pid) {
+    sid = await getActiveSeasonId(pid);
+    standingsState.seasonId = sid;
+    standingsState._lastPid = pid;
+  }
+  if (!sid) { setStandingsStatus('Could not find active season.'); return; }
+
+  // Final cache hit → instant render
+  const finalCached = readStandingsCache(pid, sid);
+  if (finalCached) {
+    standingsState.data = finalCached;
+    setStandingsStatus('');
+    renderStandingsFilters(finalCached);
+    renderStandingsTable(applyStandingsFilters(finalCached));
+    try {
+      const { ts } = JSON.parse(localStorage.getItem(standingsCacheKey(pid, sid)));
+      const mins = Math.round((Date.now() - ts) / 60000);
+      const note = document.getElementById('st-cache-note');
+      if (note) note.textContent = 'Cached ' + (mins < 60 ? mins + 'm ago' : Math.round(mins / 60) + 'h ago');
+    } catch (_) {}
+    return;
+  }
+
+  // No final cache — fetch progressively.
+  // Simultaneously load map team data (grade + location) so we can enrich as we go.
+  let teamsByNum = null;    // number → slimTeam, populated once map data is ready
+  let currentByTeam = null; // live reference to the accumulator inside fetchSkillsStandings
+  let filtersRendered = false;
+
+  // Build teamsByNum from whatever source is fastest: in-memory → localStorage → API
+  const teamDataReady = (async () => {
+    // Already in memory from a previous map load
+    if (_teamsByProgram[pid]?.length) {
+      teamsByNum = Object.fromEntries(_teamsByProgram[pid].map(t => [t.number, t]));
+      return;
+    }
+    // Try the per-program localStorage cache
+    const lsCached = _readProgCache(pid);
+    if (lsCached) {
+      _teamsByProgram[pid] = lsCached;
+      teamsByNum = Object.fromEntries(lsCached.map(t => [t.number, t]));
+      return;
+    }
+    // Fetch from API (same path as the map, 8 concurrent pages)
+    const url = `/teams?myTeams=false&registered=true&program[]=${pid}` +
+      (sid ? `&season[]=${sid}` : '');
+    const teams = await fetchMapTeams(url, () => {});
+    _teamsByProgram[pid] = teams;
+    _writeProgCache(pid, teams);
+    teamsByNum = Object.fromEntries(teams.map(t => [t.number, t]));
+  })();
+
+  // Once team data is ready, enrich whatever skills are already loaded and re-render
+  teamDataReady.then(() => {
+    if (!currentByTeam || !teamsByNum) return;
+    enrichFromTeamData(currentByTeam, teamsByNum);
+    const result = buildSkillsResult(currentByTeam);
+    standingsState.data = result;
+    renderStandingsFilters(result);
+    renderStandingsTable(applyStandingsFilters(result));
+  }).catch(() => {});
+
+  function onUpdate(byTeam, done, total) {
+    if (!byTeam) { setStandingsStatus('Fetching event list…'); return; }
+    currentByTeam = byTeam;
+
+    // Enrich with location/grade data if team map is already available
+    if (teamsByNum) enrichFromTeamData(byTeam, teamsByNum);
+
+    const result = buildSkillsResult(byTeam);
+    standingsState.data = result;
+
+    const isComplete = done >= total && total > 0;
+    setStandingsStatus(
+      isComplete ? '' : `${done.toLocaleString()} / ${total.toLocaleString()} events loaded`,
+      done, isComplete ? 0 : total
+    );
+
+    if (!filtersRendered || isComplete) {
+      renderStandingsFilters(result);
+      filtersRendered = true;
+    }
+    renderStandingsTable(applyStandingsFilters(result));
+  }
+
+  try {
+    await fetchSkillsStandings(pid, sid, onUpdate);
+    // Wait for team data before writing the final cache so location is baked in
+    await teamDataReady.catch(() => {});
+    if (currentByTeam && teamsByNum) enrichFromTeamData(currentByTeam, teamsByNum);
+    const enriched = buildSkillsResult(currentByTeam || {});
+    standingsState.data = enriched;
+    writeStandingsCache(pid, sid, enriched);
+    setStandingsStatus('');
+    renderStandingsFilters(enriched);
+    renderStandingsTable(applyStandingsFilters(enriched));
+  } catch (err) {
+    setStandingsStatus('Error: ' + err.message);
+  }
+}
+
+async function openStandingsView() {
+  showView('view-standings');
+  // Keep existing data if same program — just re-render
+  if (standingsState.data && standingsState._lastPid === standingsState.programId) {
+    renderStandingsFilters(standingsState.data);
+    renderStandingsTable(applyStandingsFilters(standingsState.data));
+    return;
+  }
+  await loadStandingsData();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

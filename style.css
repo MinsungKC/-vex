@@ -1171,3 +1171,59 @@ tbody tr:hover td { background: var(--bg); }
 .leaflet-container { background: #a8c8e8; font-family: inherit; }
 [data-theme="dark"] .leaflet-container { background: #2a3f5f; }
 .leaflet-tooltip { font-family: inherit; font-size: .82rem; }
+
+/* ── Standings ── */
+.standings-filter-bar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px;
+}
+.st-cache-note {
+  font-size: .75rem; color: var(--text-muted); margin-left: 4px;
+}
+.standings-table {
+  width: 100%; border-collapse: collapse; font-size: .85rem;
+}
+.standings-table thead th {
+  text-align: left; padding: 7px 10px; font-size: .75rem; font-weight: 600;
+  color: var(--text-muted); border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.standings-table thead th.th-sorted {
+  color: var(--accent);
+}
+.standings-table tbody tr {
+  border-bottom: 1px solid var(--border); transition: background .1s;
+}
+.standings-table tbody tr:hover { background: var(--accent-bg); }
+.standings-table td {
+  padding: 6px 10px; vertical-align: middle;
+}
+.st-rank {
+  font-size: .8rem; color: var(--text-muted); font-variant-numeric: tabular-nums; width: 36px;
+}
+.st-score {
+  font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap;
+}
+.st-score-hi {
+  font-weight: 700; color: var(--text);
+}
+.st-stop {
+  font-size: .72rem; color: var(--text-muted); margin-left: 3px;
+}
+.st-summary {
+  font-size: .82rem; color: var(--text-muted); margin-bottom: 10px;
+}
+.btn-load-more {
+  display: block; margin: 18px auto 0; padding: 8px 28px;
+  border-radius: 8px; border: 1px solid var(--border);
+  background: var(--card); color: var(--text); font-family: inherit;
+  font-size: .85rem; cursor: pointer; transition: background .15s;
+}
+.btn-load-more:hover { background: var(--accent-bg); }
+
+.st-progress-wrap {
+  height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px; overflow: hidden;
+}
+.st-progress-bar {
+  height: 100%; background: var(--accent); border-radius: 2px;
+  transition: width .3s ease;
+}

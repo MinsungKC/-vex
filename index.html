@@ -35,12 +35,13 @@
       <div class="tabs">
         <button class="tab active" data-tab="team">By Team Number</button>
         <button class="tab" data-tab="event">Browse Events</button>
+        <button class="tab" data-tab="standings">Standings</button>
         <button class="tab" data-tab="map" id="map-nav-btn">Explore Teams</button>
       </div>
 
       <!-- Team search panel -->
       <div class="search-row" id="panel-team">
-        <input id="teamNumber" type="text" placeholder="e.g. 2397A or 2496V" autocomplete="off" />
+        <input id="teamNumber" type="text" placeholder="e.g. 2397A or 8838E" autocomplete="off" />
         <button id="teamSearchBtn" class="btn-primary">Search</button>
       </div>
 
@@ -88,6 +89,19 @@
       <div id="team-event-hero"></div>
       <div id="team-event-status" class="status hidden"></div>
       <div id="team-event-content"></div>
+    </div>
+
+    <!-- ── Standings view ── -->
+    <div id="view-standings" class="view hidden">
+      <button class="back-btn" id="back-from-standings">← Back</button>
+      <div class="page-heading">
+        <h1>Skills Standings</h1>
+        <p class="page-sub">Top skills scores by program — driver, programming, and combined.</p>
+      </div>
+      <div id="standings-controls"></div>
+      <div id="standings-filters"></div>
+      <div id="standings-status" class="status hidden"></div>
+      <div id="standings-content"></div>
     </div>
 
     <!-- ── World Map view ── -->

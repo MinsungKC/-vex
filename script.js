@@ -97,7 +97,7 @@ async function fetchAllPages(path) {
 }
 
 // ── View routing ───────────────────────────────────────────────────────────
-const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings'];
+const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings', 'view-compare'];
 function showView(id) {
   VIEWS.forEach(v => document.getElementById(v).classList.toggle('hidden', v !== id));
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -111,6 +111,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     const which = tab.dataset.tab;
     if (which === 'map') { openMapView(); return; }
     if (which === 'standings') { openStandingsView(); return; }
+    if (which === 'compare') { openCompareView(); return; }
     document.getElementById('panel-team').classList.toggle('hidden', which !== 'team');
     document.getElementById('panel-event').classList.toggle('hidden', which !== 'event');
     if (which === 'event') onEventTabActivated();
@@ -133,6 +134,13 @@ document.getElementById('back-from-standings').addEventListener('click', () => {
   document.getElementById('panel-team').classList.remove('hidden');
   document.getElementById('panel-event').classList.add('hidden');
 });
+document.getElementById('back-from-compare').addEventListener('click', () => {
+  showView('view-search');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-tab="team"]')?.classList.add('active');
+  document.getElementById('panel-team').classList.remove('hidden');
+  document.getElementById('panel-event').classList.add('hidden');
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TEAM SEARCH
@@ -146,6 +154,26 @@ document.getElementById('teamSearchBtn').addEventListener('click', () => {
 document.getElementById('teamNumber').addEventListener('keydown', e => {
   if (e.key === 'Enter') document.getElementById('teamSearchBtn').click();
 });
+
+// Navigate directly to a team's seasons view — used from standings where we know the program.
+// Filters by program ID so e.g. "1234A" in V5RC doesn't match a VIQRC team with the same number.
+async function goToTeam(number, programId) {
+  try {
+    const json = await apiFetch(
+      `/teams?number[]=${encodeURIComponent(number)}&program[]=${programId}&myTeams=false`
+    );
+    const team = json.data?.[0];
+    if (team) { openSeasonsView(team); return; }
+    // Fallback: search without program filter if nothing found
+    const fallback = await apiFetch(`/teams?number[]=${encodeURIComponent(number)}&myTeams=false`);
+    if (fallback.data?.[0]) { openSeasonsView(fallback.data[0]); return; }
+    setStatus('search', `Team ${esc(number)} not found.`, 'error');
+    showView('view-search');
+  } catch (err) {
+    setStatus('search', `Error: ${err.message}`, 'error');
+    showView('view-search');
+  }
+}
 
 async function searchByTeam(number) {
   clearSearch();
@@ -195,8 +223,8 @@ async function initEventTab() {
     ]);
     const byProgram = {
       'V5RC':  (s1.data  || []).sort((a, b) => b.id - a.id),
-      'VIQRC': (s4.data  || []).sort((a, b) => b.id - a.id),
-      'VEXU':  (s41.data || []).sort((a, b) => b.id - a.id),
+      'VEXU':  (s4.data  || []).sort((a, b) => b.id - a.id),
+      'VIQRC': (s41.data || []).sort((a, b) => b.id - a.id),
     };
     const sel = document.getElementById('seasonSelect');
     sel.innerHTML = Object.entries(byProgram).map(([prog, seasons]) =>
@@ -1498,6 +1526,7 @@ function renderSimResults(results) {
 let standingsState = {
   programId: 1,
   seasonId: null,
+  availableSeasons: [],  // [{ id, name }] for current program
   sort: 'combined',   // 'combined' | 'driver' | 'programming' | 'trueskill'
   grade: 'all',
   country: '',
@@ -1530,147 +1559,197 @@ function writeStandingsCache(pid, sid, data) {
   }
 }
 
-// Event list: 1h TTL
-function evListCacheKey(pid, sid) { return `vexevlist_${pid}_${sid}`; }
-function readEvListCache(pid, sid) {
-  try {
-    const raw = localStorage.getItem(evListCacheKey(pid, sid));
-    if (!raw) return null;
-    const { ts, data } = JSON.parse(raw);
-    if (Date.now() - ts < 60 * 60 * 1000) return data;
-  } catch (_) {}
-  return null;
-}
-function writeEvListCache(pid, sid, data) {
-  try { localStorage.setItem(evListCacheKey(pid, sid), JSON.stringify({ ts: Date.now(), data })); } catch (_) {}
-}
-
-// Partial progress cache: aggregated byTeam + set of already-fetched event IDs.
-// No TTL — any saved progress is better than starting over.
-// Written every 50 events; deleted when the final cache is written.
+// Partial progress cache — byTeam dict + how many pages were fetched.
+// No TTL: any saved progress beats starting over.
+// Written every 20 pages; deleted when final cache is written.
 function partialCacheKey(pid, sid) { return `vexskills_partial_${pid}_${sid}`; }
 function readPartialCache(pid, sid) {
   try { return JSON.parse(localStorage.getItem(partialCacheKey(pid, sid)) || 'null'); } catch (_) { return null; }
 }
-function writePartialCache(pid, sid, byTeam, fetchedIds) {
+function writePartialCache(pid, sid, byTeam, doneNums) {
+  const payload = { byTeam, doneNums };
   try {
-    localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify({ byTeam, fetchedIds: [...fetchedIds] }));
+    localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify(payload));
   } catch (_) {
     try {
-      // Quota fallback: drop city/region to shrink payload
       const slim = {};
       for (const [k, t] of Object.entries(byTeam)) { slim[k] = { ...t }; delete slim[k].city; delete slim[k].region; }
-      localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify({ byTeam: slim, fetchedIds: [...fetchedIds] }));
+      localStorage.setItem(partialCacheKey(pid, sid), JSON.stringify({ byTeam: slim, doneNums }));
     } catch (_2) {}
   }
 }
 
-// Merge raw /events/{id}/skills entries into a byTeam accumulator (mutates in place).
-function mergeSkillsInto(byTeam, entries) {
-  for (const s of entries) {
-    const num = s.team?.name;
-    if (!num) continue;
-    if (!byTeam[num]) {
-      byTeam[num] = {
-        number: num, grade: s.team?.grade || '',
-        programId: s.team?.program?.id,
-        country: s.team?.location?.country || '',
-        region:  s.team?.location?.region  || '',
-        city:    s.team?.location?.city    || '',
-        driver: 0, driverStop: null, programming: 0, programmingStop: null,
-      };
-    }
-    const t = byTeam[num];
-    if (s.type === 'driver'      && s.score > t.driver)      { t.driver      = s.score; t.driverStop      = s.stop_time ?? null; }
-    if (s.type === 'programming' && s.score > t.programming) { t.programming = s.score; t.programmingStop = s.stop_time ?? null; }
-  }
-}
-
-// Convert byTeam accumulator to the final sorted array.
+// Convert byTeam accumulator to the final result array.
+// Only includes teams that have posted at least one skills score this season.
 function buildSkillsResult(byTeam) {
-  return Object.values(byTeam).map(t => ({
-    ...t,
-    combined:  t.driver + t.programming,
-    trueSkill: t.driver + t.programming +
-      (t.driver > 0 && t.programming > 0 ? Math.min(t.driver, t.programming) * 0.15 : 0),
-  }));
+  return Object.values(byTeam)
+    .filter(t => t.driver > 0 || t.programming > 0)
+    .map(t => ({ ...t, combined: t.driver + t.programming, trueSkill: 0 }));
 }
 
-// Fill in missing grade / location fields from the map team lookup.
-// teamsByNum is a plain object: { "2397A": slimTeam, ... }
-function enrichFromTeamData(byTeam, teamsByNum) {
-  for (const [num, t] of Object.entries(byTeam)) {
-    const m = teamsByNum[num];
-    if (!m) continue;
-    if (!t.grade   && m.grade)              t.grade   = m.grade;
-    if (!t.country && m.location?.country)  t.country = m.location.country;
-    if (!t.region  && m.location?.region)   t.region  = m.location.region;
-    if (!t.city    && m.location?.city)     t.city    = m.location.city;
+// ── TrueSkill: composite rating from skills, awards, rank, win rate ────────
+// Populated lazily when the user selects TrueSkill sort.
+const trueSkillCache = {};   // teamNumber → { awardsScore, avgRank, winRate, eventsPlayed }
+let   trueSkillLoading = false;
+
+// Award title → weight. Excellence outweighs everything; tournament wins count too.
+const AWARD_WEIGHTS = [
+  [/excellence/i,           3.0],
+  [/tournament.champion|champion/i, 2.5],
+  [/skills.champion/i,      2.0],
+  [/design|think|innovate|build|inspire/i, 1.5],
+];
+function awardWeight(title) {
+  for (const [re, w] of AWARD_WEIGHTS) if (re.test(title)) return w;
+  return 1.0;
+}
+
+function computeTrueSkill(t, maxCombined) {
+  const skillsScore = maxCombined > 0 ? t.combined / maxCombined : 0;
+  const ts = trueSkillCache[t.number];
+  if (!ts) return +(skillsScore * 3.5).toFixed(2); // provisional until data loads
+
+  // Awards: weighted awards per event, normalized — 1 excellence/event = 1.0
+  const awardsNorm = Math.min(ts.awardsScore / 3, 1);
+  // Rank: 1/sqrt(avgRank) — rank 1 = 1.0, rank 4 = 0.5, rank 9 = 0.33
+  const rankNorm   = ts.avgRank > 0 ? Math.min(1, 1 / Math.sqrt(ts.avgRank)) : 0;
+  const winNorm    = ts.winRate;
+
+  // Scale 0–10 with 2 decimal places so differences feel tighter
+  return +(10 * (skillsScore * 0.35 + awardsNorm * 0.25 + rankNorm * 0.25 + winNorm * 0.15)).toFixed(2);
+}
+
+async function loadTrueSkillData() {
+  if (trueSkillLoading) return;
+  const data = standingsState.data;
+  const sid  = standingsState.seasonId;
+  if (!data?.length || !sid) return;
+
+  const needed = data.filter(t => t.teamId && !trueSkillCache[t.number]);
+  if (!needed.length) {
+    _recomputeAndRender();
+    return;
   }
+
+  trueSkillLoading = true;
+  let done = 0;
+  const total = needed.length;
+  let timer = null;
+
+  function scheduleRender() {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      setStandingsStatus(`Rating: ${done.toLocaleString()} / ${total.toLocaleString()} teams loaded`, done, total);
+      _recomputeAndRender();
+    }, 300);
+  }
+
+  await promisePool(needed.map(t => async () => {
+    try {
+      const [awJson, rkJson] = await Promise.all([
+        apiFetch(`/teams/${t.teamId}/awards?season[]=${sid}`),
+        apiFetch(`/teams/${t.teamId}/rankings?season[]=${sid}`),
+      ]);
+      const awards   = awJson.data  || [];
+      const rankings = rkJson.data  || [];
+
+      // Awards score = sum of weights / events played
+      const awardSum = awards.reduce((s, a) => s + awardWeight(a.title || ''), 0);
+      const eventsPlayed = rankings.length;
+
+      let totalRank = 0, wins = 0, matches = 0;
+      for (const r of rankings) {
+        totalRank += r.rank || 0;
+        wins      += r.wins || 0;
+        matches   += (r.wins || 0) + (r.losses || 0) + (r.ties || 0);
+      }
+
+      trueSkillCache[t.number] = {
+        awardsScore:  eventsPlayed > 0 ? awardSum / eventsPlayed : 0,
+        avgRank:      eventsPlayed > 0 ? totalRank / eventsPlayed : 999,
+        winRate:      matches > 0 ? wins / matches : 0,
+        eventsPlayed,
+      };
+    } catch (_) {}
+    done++;
+    scheduleRender();
+  }), 8);
+
+  clearTimeout(timer);
+  trueSkillLoading = false;
+  setStandingsStatus('');
+  _recomputeAndRender();
 }
 
-// Fetch skills for a season by scanning every event.
-// Calls onUpdate(byTeam, done, total) progressively as events are processed.
-// Saves partial progress to localStorage every 50 events so a reload can resume.
+function _recomputeAndRender() {
+  const data = standingsState.data;
+  if (!data) return;
+  const maxCombined = Math.max(1, ...data.map(t => t.combined));
+  data.forEach(t => { t.trueSkill = computeTrueSkill(t, maxCombined); });
+  renderStandingsTable(applyStandingsFilters(data));
+}
+
+// Fetch the full skills standings from the RobotEvents legacy endpoint.
+// One call per grade level (~3 total) returns the complete standings instantly —
+// no auth token required, no event scanning, no per-team calls.
+const SKILLS_GRADE_LEVELS = {
+  1:  ['High School', 'Middle School'],          // V5RC
+  4:  ['College'],                               // VEXU
+  41: ['Middle School', 'Elementary School'],    // VIQRC
+};
+
 async function fetchSkillsStandings(pid, sid, onUpdate) {
-  // Final 12h cache → instant return
   const cached = readStandingsCache(pid, sid);
   if (cached) return cached;
 
-  // Event list (1h cache)
-  onUpdate?.(null, 0, 0);
-  let evList = readEvListCache(pid, sid);
-  if (!evList) {
-    const evData = await fetchAllPages(`/events?season[]=${sid}&program[]=${pid}&per_page=250`);
-    evList = evData.map(e => ({ id: e.id }));
-    writeEvListCache(pid, sid, evList);
-  }
-  const total = evList.length;
+  const byTeam    = {};
+  const gradeList = SKILLS_GRADE_LEVELS[pid] || ['High School', 'Middle School'];
+  const total     = gradeList.length;
 
-  // Restore partial progress from a previous run
-  const partial   = readPartialCache(pid, sid);
-  const byTeam    = partial?.byTeam    ? { ...partial.byTeam } : {};
-  const fetchedIds = new Set(partial?.fetchedIds || []);
-  let done = fetchedIds.size;
-
-  // Events not yet fetched
-  const remaining = evList.filter(ev => !fetchedIds.has(ev.id));
-
-  // Emit initial state immediately (re-renders table from cached partial progress)
-  if (done > 0) onUpdate?.(byTeam, done, total);
-
-  let renderTimer = null;
-  let lastSave    = done;
-
-  function scheduleUpdate() {
-    clearTimeout(renderTimer);
-    renderTimer = setTimeout(() => {
-      onUpdate?.(byTeam, done, total);
-      // Persist partial progress every 50 new events
-      if (done - lastSave >= 50) {
-        writePartialCache(pid, sid, byTeam, fetchedIds);
-        lastSave = done;
+  function mergeEntries(entries, pid) {
+    for (const entry of entries) {
+      const num = entry.team?.team;
+      if (!num) continue;
+      const driver      = entry.scores?.driver      || 0;
+      const programming = entry.scores?.programming || 0;
+      const existing    = byTeam[num];
+      // Update driver and programming scores independently — take best of each
+      if (!existing) {
+        byTeam[num] = {
+          number:      num,
+          teamId:      entry.team?.id         || null,
+          grade:       entry.team?.gradeLevel || '',
+          programId:   pid,
+          country:     entry.team?.country    || '',
+          region:      entry.team?.region     || '',
+          city:        entry.team?.city       || '',
+          driver,      driverStop:      driver      > 0 ? (entry.scores?.driverStopTime || null) : null,
+          programming, programmingStop: programming > 0 ? (entry.scores?.progStopTime   || null) : null,
+        };
+      } else {
+        if (driver      > existing.driver)      { existing.driver      = driver;      existing.driverStop      = entry.scores?.driverStopTime || null; }
+        if (programming > existing.programming) { existing.programming = programming; existing.programmingStop = entry.scores?.progStopTime   || null; }
       }
-    }, 250);
+    }
   }
 
-  await promisePool(remaining.map(ev => async () => {
+  for (let i = 0; i < gradeList.length; i++) {
+    const grade = gradeList[i];
+    onUpdate?.(null, i, total);
     try {
-      const entries = await fetchAllPages(`/events/${ev.id}/skills`);
-      mergeSkillsInto(byTeam, entries);
-    } catch (_) { /* skip failed event */ }
-    fetchedIds.add(ev.id);
-    done++;
-    scheduleUpdate();
-  }), 8);
+      const base = `https://www.robotevents.com/api/seasons/${sid}/skills?grade_level=${encodeURIComponent(grade)}`;
+      const [regular, worlds] = await Promise.all([
+        fetch(base + '&post_season=0').then(r => r.ok ? r.json() : []),
+        fetch(base + '&post_season=1').then(r => r.ok ? r.json() : []),
+      ]);
+      mergeEntries(regular, pid);
+      mergeEntries(worlds,  pid);
+    } catch (_) {}
+    onUpdate?.(byTeam, i + 1, total);
+  }
 
-  clearTimeout(renderTimer);
-
-  // Write final cache and clean up partial
   const result = buildSkillsResult(byTeam);
   writeStandingsCache(pid, sid, result);
-  try { localStorage.removeItem(partialCacheKey(pid, sid)); } catch (_) {}
-
   return result;
 }
 
@@ -1680,8 +1759,22 @@ function applyStandingsFilters(data) {
   if (grade   !== 'all' && grade)   out = out.filter(t => t.grade   === grade);
   if (country)                      out = out.filter(t => t.country === country);
   if (region)                       out = out.filter(t => t.region  === region);
-  const key = sort === 'driver' ? 'driver' : sort === 'programming' ? 'programming' : sort === 'trueskill' ? 'trueSkill' : 'combined';
-  out = [...out].sort((a, b) => b[key] - a[key] || b.combined - a.combined);
+  // Stop time tiebreakers: lower is better; 0/null means no stop time recorded → treat as worst.
+  const pStop = t => (t.programmingStop > 0 ? t.programmingStop : Infinity);
+  const dStop = t => (t.driverStop      > 0 ? t.driverStop      : Infinity);
+
+  if (sort === 'driver') {
+    out = [...out].sort((a, b) => b.driver - a.driver || dStop(a) - dStop(b));
+  } else if (sort === 'programming') {
+    out = [...out].sort((a, b) => b.programming - a.programming || pStop(a) - pStop(b));
+  } else if (sort === 'trueskill') {
+    out = [...out].sort((a, b) => b.trueSkill - a.trueSkill || b.combined - a.combined);
+  } else {
+    // Combined: tiebreak by programming stop time, then driver stop time
+    out = [...out].sort((a, b) =>
+      b.combined - a.combined || pStop(a) - pStop(b) || dStop(a) - dStop(b)
+    );
+  }
   return out;
 }
 
@@ -1709,27 +1802,33 @@ function renderStandingsFilters(data) {
   const prog = standingsState.programId;
   const sel = (val, cur) => val === cur ? ' selected' : '';
 
+  const seasons = standingsState.availableSeasons;
+
   el.innerHTML =
     '<div class="standings-filter-bar">' +
     // Program
     '<select class="map-filter-select" id="st-prog">' +
     '<option value="1"'  + sel(1,  prog) + '>V5RC</option>' +
-    '<option value="4"'  + sel(4,  prog) + '>VIQRC</option>' +
-    '<option value="41"' + sel(41, prog) + '>VEXU</option>' +
+    '<option value="4"'  + sel(4,  prog) + '>VEXU</option>'  +
+    '<option value="41"' + sel(41, prog) + '>VIQRC</option>' +
     '</select>' +
+    // Season
+    (seasons.length ? '<select class="map-filter-select" id="st-season">' +
+      seasons.map(s => '<option value="' + s.id + '"' + (s.id === standingsState.seasonId ? ' selected' : '') + '>' + esc(s.name) + '</option>').join('') +
+      '</select>' : '') +
     // Sort
     '<select class="map-filter-select" id="st-sort">' +
     '<option value="combined"'    + sel('combined',    standingsState.sort) + '>Combined</option>' +
     '<option value="driver"'      + sel('driver',      standingsState.sort) + '>Driver Skills</option>' +
     '<option value="programming"' + sel('programming', standingsState.sort) + '>Programming Skills</option>' +
-    '<option value="trueskill"'   + sel('trueskill',   standingsState.sort) + '>TrueSkill</option>' +
+    '<option value="trueskill"'   + sel('trueskill',   standingsState.sort) + '>Rating</option>' +
     '</select>' +
-    // Grade
+    // Grade — options depend on program
     '<select class="map-filter-select" id="st-grade">' +
-    '<option value="all"'           + sel('all',           standingsState.grade) + '>All Grades</option>' +
-    '<option value="Middle School"' + sel('Middle School', standingsState.grade) + '>Middle School</option>' +
-    '<option value="High School"'   + sel('High School',   standingsState.grade) + '>High School</option>' +
-    '<option value="College"'       + sel('College',       standingsState.grade) + '>College</option>' +
+    '<option value="all"' + sel('all', standingsState.grade) + '>All Grades</option>' +
+    (SKILLS_GRADE_LEVELS[prog] || []).map(g =>
+      '<option value="' + esc(g) + '"' + sel(g, standingsState.grade) + '>' + esc(g) + '</option>'
+    ).join('') +
     '</select>' +
     // Country
     '<select class="map-filter-select" id="st-country">' +
@@ -1748,12 +1847,23 @@ function renderStandingsFilters(data) {
 
   document.getElementById('st-prog').addEventListener('change', e => {
     standingsState.programId = +e.target.value;
+    standingsState.seasonId = null; standingsState.availableSeasons = [];
     standingsState.country = ''; standingsState.region = ''; standingsState.page = 0;
+    standingsState.data = null;
+    Object.keys(trueSkillCache).forEach(k => delete trueSkillCache[k]);
+    loadStandingsData();
+  });
+  document.getElementById('st-season')?.addEventListener('change', e => {
+    standingsState.seasonId = +e.target.value;
+    standingsState.data = null; standingsState.page = 0;
+    standingsState.country = ''; standingsState.region = '';
+    Object.keys(trueSkillCache).forEach(k => delete trueSkillCache[k]);
     loadStandingsData();
   });
   document.getElementById('st-sort').addEventListener('change', e => {
     standingsState.sort = e.target.value; standingsState.page = 0;
-    renderStandingsTable(applyStandingsFilters(standingsState.data));
+    if (e.target.value === 'trueskill') loadTrueSkillData();
+    else renderStandingsTable(applyStandingsFilters(standingsState.data));
   });
   document.getElementById('st-grade').addEventListener('change', e => {
     standingsState.grade = e.target.value; standingsState.page = 0;
@@ -1806,7 +1916,7 @@ function renderStandingsTable(filtered) {
       scoreCell(t.combined,     null,             sort === 'combined'    || isTS) +
       scoreCell(t.driver,       t.driverStop,     sort === 'driver') +
       scoreCell(t.programming,  t.programmingStop, sort === 'programming') +
-      (isTS ? '<td class="st-score st-score-hi">' + t.trueSkill.toFixed(0) + '</td>' : '') +
+      (isTS ? '<td class="st-score st-score-hi">' + t.trueSkill.toFixed(2) + '<span style="font-size:.7rem;opacity:.55">/10</span></td>' : '') +
       '</tr>';
   });
 
@@ -1819,14 +1929,14 @@ function renderStandingsTable(filtered) {
     '<th class="' + (sort === 'combined' || isTS ? 'th-sorted' : '') + '">Combined</th>' +
     '<th class="' + (sort === 'driver'          ? 'th-sorted' : '') + '">Driver</th>' +
     '<th class="' + (sort === 'programming'     ? 'th-sorted' : '') + '">Programming</th>' +
-    (isTS ? '<th class="th-sorted">TrueSkill</th>' : '') +
+    (isTS ? '<th class="th-sorted">Rating (/10)</th>' : '') +
     '</tr></thead>' +
     '<tbody>' + rows + '</tbody>' +
     '</table></div>' +
     (hasMore ? '<button class="btn-load-more" id="st-load-more">Load more (' + (filtered.length - slice.length) + ' remaining)</button>' : '');
 
   el.querySelectorAll('.team-link').forEach(btn => {
-    btn.addEventListener('click', () => searchByTeam(btn.dataset.num));
+    btn.addEventListener('click', () => goToTeam(btn.dataset.num, standingsState.programId));
   });
   document.getElementById('st-load-more')?.addEventListener('click', () => {
     standingsState.page++;
@@ -1838,12 +1948,18 @@ async function loadStandingsData() {
   const pid = standingsState.programId;
   setStandingsStatus('Loading season info…');
 
-  let sid = standingsState.seasonId;
-  if (!sid || standingsState._lastPid !== pid) {
-    sid = await getActiveSeasonId(pid);
-    standingsState.seasonId = sid;
+  // Load (or refresh) the full season list when the program changes
+  if (!standingsState.availableSeasons.length || standingsState._lastPid !== pid) {
+    const seasons = await fetchProgramSeasons(pid);
+    standingsState.availableSeasons = seasons;
+    // Default to the first (most recent/active) season unless user already picked one for this program
+    if (!standingsState.seasonId || standingsState._lastPid !== pid) {
+      standingsState.seasonId = seasons[0]?.id || null;
+    }
     standingsState._lastPid = pid;
   }
+
+  const sid = standingsState.seasonId;
   if (!sid) { setStandingsStatus('Could not find active season.'); return; }
 
   // Final cache hit → instant render
@@ -1863,59 +1979,24 @@ async function loadStandingsData() {
   }
 
   // No final cache — fetch progressively.
-  // Simultaneously load map team data (grade + location) so we can enrich as we go.
-  let teamsByNum = null;    // number → slimTeam, populated once map data is ready
-  let currentByTeam = null; // live reference to the accumulator inside fetchSkillsStandings
+  // Grade/location come directly from the team list (already in fetchSkillsStandings).
   let filtersRendered = false;
 
-  // Build teamsByNum from whatever source is fastest: in-memory → localStorage → API
-  const teamDataReady = (async () => {
-    // Already in memory from a previous map load
-    if (_teamsByProgram[pid]?.length) {
-      teamsByNum = Object.fromEntries(_teamsByProgram[pid].map(t => [t.number, t]));
-      return;
-    }
-    // Try the per-program localStorage cache
-    const lsCached = _readProgCache(pid);
-    if (lsCached) {
-      _teamsByProgram[pid] = lsCached;
-      teamsByNum = Object.fromEntries(lsCached.map(t => [t.number, t]));
-      return;
-    }
-    // Fetch from API (same path as the map, 8 concurrent pages)
-    const url = `/teams?myTeams=false&registered=true&program[]=${pid}` +
-      (sid ? `&season[]=${sid}` : '');
-    const teams = await fetchMapTeams(url, () => {});
-    _teamsByProgram[pid] = teams;
-    _writeProgCache(pid, teams);
-    teamsByNum = Object.fromEntries(teams.map(t => [t.number, t]));
-  })();
-
-  // Once team data is ready, enrich whatever skills are already loaded and re-render
-  teamDataReady.then(() => {
-    if (!currentByTeam || !teamsByNum) return;
-    enrichFromTeamData(currentByTeam, teamsByNum);
-    const result = buildSkillsResult(currentByTeam);
-    standingsState.data = result;
-    renderStandingsFilters(result);
-    renderStandingsTable(applyStandingsFilters(result));
-  }).catch(() => {});
-
   function onUpdate(byTeam, done, total) {
-    if (!byTeam) { setStandingsStatus('Fetching event list…'); return; }
-    currentByTeam = byTeam;
-
-    // Enrich with location/grade data if team map is already available
-    if (teamsByNum) enrichFromTeamData(byTeam, teamsByNum);
+    const GRADE_LABELS = ['High School', 'Middle School', 'College'];
+    if (!byTeam) {
+      setStandingsStatus('Loading ' + (GRADE_LABELS[done] || 'skills') + '…');
+      return;
+    }
 
     const result = buildSkillsResult(byTeam);
     standingsState.data = result;
 
     const isComplete = done >= total && total > 0;
-    setStandingsStatus(
-      isComplete ? '' : `${done.toLocaleString()} / ${total.toLocaleString()} events loaded`,
-      done, isComplete ? 0 : total
-    );
+    const withScores = result.length;
+    const msg = isComplete ? '' :
+      `${withScores.toLocaleString()} teams · loading ${GRADE_LABELS[done] || ''}…`;
+    setStandingsStatus(msg, done, isComplete ? 0 : total);
 
     if (!filtersRendered || isComplete) {
       renderStandingsFilters(result);
@@ -1925,16 +2006,11 @@ async function loadStandingsData() {
   }
 
   try {
-    await fetchSkillsStandings(pid, sid, onUpdate);
-    // Wait for team data before writing the final cache so location is baked in
-    await teamDataReady.catch(() => {});
-    if (currentByTeam && teamsByNum) enrichFromTeamData(currentByTeam, teamsByNum);
-    const enriched = buildSkillsResult(currentByTeam || {});
-    standingsState.data = enriched;
-    writeStandingsCache(pid, sid, enriched);
+    const data = await fetchSkillsStandings(pid, sid, onUpdate);
+    standingsState.data = data;
     setStandingsStatus('');
-    renderStandingsFilters(enriched);
-    renderStandingsTable(applyStandingsFilters(enriched));
+    renderStandingsFilters(data);
+    renderStandingsTable(applyStandingsFilters(data));
   } catch (err) {
     setStandingsStatus('Error: ' + err.message);
   }
@@ -2009,12 +2085,14 @@ const COUNTRY_COORDS = {
   "Papua New Guinea":[-6.31,143.96],"Fiji":[-17.71,178.07],
 };
 
-const PROGRAM_IDS = { all: null, v5rc: 1, viqrc: 4, vexu: 41 };
+const PROGRAM_IDS = { all: null, v5rc: 1, vexu: 4, viqrc: 41 };
 
-let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, markerLayer: null, heatLayer: null, heatmap: false, sourceView: 'view-search' };
+let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, markerLayer: null, heatLayer: null, heatmap: false, skillsHeatmap: false, skillsHeatLayer: null, sourceView: 'view-search' };
 let _mapLoadGen = 0;
-const _seasonIdCache  = {};   // programId -> seasonId (in-memory, avoids repeated API calls)
-const _teamsByProgram = {};   // programId -> slimTeam[] (in-memory per-program cache)
+const _seasonIdCache      = {};   // programId -> seasonId (in-memory, avoids repeated API calls)
+const _seasonListCache    = {};   // programId -> [{ id, name }] fetched season list
+const _teamsByProgram     = {};   // programId -> slimTeam[] (map-use, no season filter)
+const _teamsByProgSeason  = {};   // `${pid}_${sid}` -> slimTeam[] (standings-use, season-filtered)
 
 function destroyLeafletMap() {
   if (mapState.leafletMap) {
@@ -2022,6 +2100,7 @@ function destroyLeafletMap() {
     mapState.leafletMap = null;
     mapState.markerLayer = null;
     mapState.heatLayer = null;
+    mapState.skillsHeatLayer = null;
   }
 }
 
@@ -2105,22 +2184,11 @@ function updateMapOverlay(teams) {
   mapState.countryData = byCountry;
   mapState.dots = dots;
 
-  if (mapState.heatmap && window.L?.heatLayer) {
-    // Heatmap mode — hide dot markers, update heat layer
-    mapState.markerLayer.clearLayers();
-    const pts = buildHeatPoints(teams);
-    if (mapState.heatLayer) {
-      mapState.heatLayer.setLatLngs(pts);
-    } else {
-      mapState.heatLayer = L.heatLayer(pts, {
-        radius: 35, blur: 30, maxZoom: 16, max: 1.0, minOpacity: 0.45,
-        gradient: { 0.2: '#0ea5e9', 0.45: '#6366f1', 0.7: '#f59e0b', 1.0: '#ef4444' },
-      }).addTo(mapState.leafletMap);
-    }
-  } else {
-    // Dot mode — remove heat layer, rebuild circle markers
-    if (mapState.heatLayer) { mapState.heatLayer.remove(); mapState.heatLayer = null; }
-    mapState.markerLayer.clearLayers();
+  const anyHeatmap = mapState.heatmap || mapState.skillsHeatmap;
+
+  // ── Dot markers — shown only when no heatmap is active ──────────────────
+  mapState.markerLayer.clearLayers();
+  if (!anyHeatmap) {
     const maxAtDot = Math.max(1, ...Object.values(dots).map(d => d.teams.length));
     for (const dot of Object.values(dots)) {
       const count  = dot.teams.length;
@@ -2140,11 +2208,158 @@ function updateMapOverlay(teams) {
     }
   }
 
+  // ── Density heatmap — only when that specific toggle is on ───────────────
+  if (mapState.heatmap && window.L?.heatLayer) {
+    const pts = buildHeatPoints(teams);
+    if (mapState.heatLayer) {
+      mapState.heatLayer.setLatLngs(pts);
+    } else {
+      mapState.heatLayer = L.heatLayer(pts, {
+        radius: 35, blur: 30, maxZoom: 16, max: 1.0, minOpacity: 0.45,
+        gradient: { 0.2: '#0ea5e9', 0.45: '#6366f1', 0.7: '#f59e0b', 1.0: '#ef4444' },
+      }).addTo(mapState.leafletMap);
+    }
+  } else if (!mapState.heatmap && mapState.heatLayer) {
+    mapState.heatLayer.remove();
+    mapState.heatLayer = null;
+  }
+
   const total = Object.values(byCountry).reduce((s, d) => s + d.count, 0);
   const legendEl = document.getElementById('map-legend');
   if (legendEl) legendEl.innerHTML =
     '<div class="map-legend"><span>1 team</span><div class="map-legend-bar"></div><span>Many teams</span>' +
     '<span style="margin-left:auto;color:var(--text-muted)">' + total.toLocaleString() + ' teams · ' + Object.keys(byCountry).length + ' countries</span></div>';
+}
+
+// US state centroids for sub-national resolution
+const US_STATE_COORDS = {
+  'Alabama':[32.80,-86.79],'Alaska':[64.20,-153.37],'Arizona':[34.05,-111.09],
+  'Arkansas':[34.80,-92.20],'California':[36.78,-119.42],'Colorado':[39.55,-105.78],
+  'Connecticut':[41.60,-72.69],'Delaware':[39.00,-75.50],'Florida':[27.99,-81.76],
+  'Georgia':[32.17,-82.90],'Hawaii':[19.90,-155.56],'Idaho':[44.07,-114.74],
+  'Illinois':[40.35,-88.99],'Indiana':[39.85,-86.26],'Iowa':[42.01,-93.21],
+  'Kansas':[38.53,-96.73],'Kentucky':[37.67,-84.67],'Louisiana':[31.17,-91.87],
+  'Maine':[44.69,-69.38],'Maryland':[39.06,-76.80],'Massachusetts':[42.23,-71.53],
+  'Michigan':[43.33,-84.54],'Minnesota':[45.69,-93.90],'Mississippi':[32.74,-89.68],
+  'Missouri':[38.46,-92.29],'Montana':[46.88,-110.36],'Nebraska':[41.13,-98.27],
+  'Nevada':[38.31,-117.06],'New Hampshire':[43.45,-71.56],'New Jersey':[40.30,-74.52],
+  'New Mexico':[34.52,-105.87],'New York':[42.17,-74.95],'North Carolina':[35.63,-79.81],
+  'North Dakota':[47.53,-99.78],'Ohio':[40.39,-82.76],'Oklahoma':[35.57,-96.93],
+  'Oregon':[44.07,-120.54],'Pennsylvania':[40.59,-77.21],'Rhode Island':[41.68,-71.51],
+  'South Carolina':[33.84,-81.16],'South Dakota':[44.30,-99.44],'Tennessee':[35.74,-86.69],
+  'Texas':[31.97,-99.90],'Utah':[39.32,-111.09],'Vermont':[44.07,-72.67],
+  'Virginia':[37.77,-78.17],'Washington':[47.75,-120.74],'West Virginia':[38.60,-80.95],
+  'Wisconsin':[43.78,-88.79],'Wyoming':[43.08,-107.29],'District of Columbia':[38.91,-77.04],
+  'Puerto Rico':[18.22,-66.59],'Guam':[13.44,144.79],
+};
+
+// Resolve a skills entry's geographic region to [lat, lon] and a region key.
+// US teams use state-level granularity; others use country centroid.
+function skillsRegionCoords(t) {
+  if (t.country === 'United States' || t.country === 'USA') {
+    const region = t.region || '';
+    // Try exact state match first
+    if (US_STATE_COORDS[region]) return { key: region, coords: US_STATE_COORDS[region] };
+    // Some regions are formatted "California" or "California Region 1" — extract state name
+    for (const state of Object.keys(US_STATE_COORDS)) {
+      if (region.startsWith(state)) return { key: state, coords: US_STATE_COORDS[state] };
+    }
+    // Unknown US region — fall back to national centroid
+    return { key: 'United States', coords: COUNTRY_COORDS['United States'] };
+  }
+  const coords = COUNTRY_COORDS[t.country];
+  if (coords) return { key: t.country, coords };
+  return null;
+}
+
+// ── Skills quality heatmap ────────────────────────────────────────────────
+// Aggregates skills scores per geographic region (US state or country),
+// computes the avg of the top-10% scores in each region as the quality signal,
+// then renders one weighted heat point per region.  One point per region means
+// no stacking artefacts and the gradient clearly shows regional skill level.
+async function loadSkillsHeatmap() {
+  if (!mapState.leafletMap) return;
+  const pid = mapState.programId || 1;
+
+  const btn = document.getElementById('map-skills-heat-toggle');
+  const sid = await getActiveSeasonId(pid);
+  if (!sid) return;
+
+  if (btn) btn.textContent = 'Loading…';
+  let allSkills;
+  try {
+    allSkills = await fetchSkillsStandings(pid, sid, null);
+  } catch (_) {
+    if (btn) btn.textContent = 'Skills Heat';
+    return;
+  }
+  if (btn) btn.textContent = 'Skills Heat';
+  if (!mapState.skillsHeatmap || !mapState.leafletMap) return;
+
+  // Top 1000 teams by combined score
+  const top1000 = allSkills
+    .filter(t => t.combined > 0)
+    .sort((a, b) => b.combined - a.combined)
+    .slice(0, 1000);
+
+  if (!top1000.length) return;
+
+  const maxScore = top1000[0].combined;
+
+  // Build one heat point per team weighted by their skills score
+  const pts = [];
+  for (const t of top1000) {
+    const country = (t.country || '').trim();
+    const region  = (t.region  || '').trim();
+    let coords = null;
+
+    // US → state-level resolution
+    if (country === 'United States' || country === 'USA') {
+      if (US_STATE_COORDS[region]) {
+        coords = US_STATE_COORDS[region];
+      } else {
+        // "California Region 1" → California
+        for (const state of Object.keys(US_STATE_COORDS)) {
+          if (region.startsWith(state)) { coords = US_STATE_COORDS[state]; break; }
+        }
+      }
+      if (!coords) coords = COUNTRY_COORDS['United States'];
+    } else if (country) {
+      coords = COUNTRY_COORDS[country] || null;
+    }
+
+    if (!coords) continue;
+
+    // Weight = normalized score; gives brighter spots to higher-scoring teams
+    const weight = t.combined / maxScore;
+    pts.push([coords[0], coords[1], weight]);
+  }
+
+  if (!pts.length) return;
+
+  if (mapState.skillsHeatLayer) {
+    mapState.skillsHeatLayer.setLatLngs(pts);
+  } else {
+    // No maxZoom — let leaflet.heat use its default so points aren't dimmed at world zoom.
+    // Gradient goes from visible blue through purple to gold/white for elite regions.
+    // max:0.7 so mid-range teams still show colour; radius large enough to see at zoom 2.
+    mapState.skillsHeatLayer = L.heatLayer(pts, {
+      radius: 30, blur: 22, max: 0.7, minOpacity: 0.55,
+      gradient: { 0.0: '#2563eb', 0.4: '#7c3aed', 0.7: '#f59e0b', 1.0: '#fef08a' },
+    }).addTo(mapState.leafletMap);
+  }
+
+  const legendEl = document.getElementById('map-legend');
+  if (legendEl && !legendEl.innerHTML.includes('Skills')) {
+    legendEl.innerHTML +=
+      '<div class="map-legend" style="margin-top:4px">' +
+      '<span style="color:var(--text-muted);font-size:.75rem">Skills:</span>' +
+      '<div class="map-legend-bar" style="background:linear-gradient(to right,#2563eb,#7c3aed,#f59e0b,#fef08a)"></div>' +
+      '<span style="font-size:.75rem">elite</span>' +
+      '<span style="margin-left:auto;color:var(--text-muted);font-size:.75rem">' +
+      'top ' + pts.length + ' teams · weighted by score</span>' +
+      '</div>';
+  }
 }
 
 async function openMapView(eventId) {
@@ -2166,8 +2381,8 @@ async function openMapView(eventId) {
       : '<select class="map-filter-select" id="map-prog-select">' +
         '<option value="all"' + (mapState.programId === null ? ' selected' : '') + '>All Programs</option>' +
         '<option value="v5rc"'  + (mapState.programId === 1  ? ' selected' : '') + '>V5RC</option>' +
-        '<option value="viqrc"' + (mapState.programId === 4  ? ' selected' : '') + '>VIQRC</option>' +
-        '<option value="vexu"'  + (mapState.programId === 41 ? ' selected' : '') + '>VEXU</option>' +
+        '<option value="vexu"'  + (mapState.programId === 4  ? ' selected' : '') + '>VEXU</option>'  +
+        '<option value="viqrc"' + (mapState.programId === 41 ? ' selected' : '') + '>VIQRC</option>' +
         '</select>' +
         '<select class="map-filter-select" id="map-grade-select">' +
         '<option value="all"'          + (mapState.grade === 'all'           ? ' selected' : '') + '>All Grades</option>' +
@@ -2175,7 +2390,8 @@ async function openMapView(eventId) {
         '<option value="High School"'  + (mapState.grade === 'High School'   ? ' selected' : '') + '>High School</option>' +
         '<option value="College"'      + (mapState.grade === 'College'       ? ' selected' : '') + '>College</option>' +
         '</select>') +
-    '<button class="map-toggle-btn' + (mapState.heatmap ? ' active' : '') + '" id="map-heat-toggle" title="Toggle smooth heatmap">Heatmap</button>' +
+    '<button class="map-toggle-btn' + (mapState.heatmap ? ' active' : '') + '" id="map-heat-toggle" title="Team density heatmap">Density Heat Map</button>' +
+    '<button class="map-toggle-btn' + (mapState.skillsHeatmap ? ' active' : '') + '" id="map-skills-heat-toggle" title="Skills quality heatmap — brighter = higher combined skills scores">Skills Heat Map</button>' +
     '</div>';
 
   if (!eventId) {
@@ -2202,11 +2418,39 @@ async function openMapView(eventId) {
     if (mapState.allTeams) updateMapOverlay(mapState.allTeams);
   });
 
+  document.getElementById('map-skills-heat-toggle').addEventListener('click', async function () {
+    const ok = await ensureLeafletHeat();
+    if (!ok) return;
+    mapState.skillsHeatmap = !mapState.skillsHeatmap;
+    this.classList.toggle('active', mapState.skillsHeatmap);
+    if (mapState.skillsHeatmap) {
+      loadSkillsHeatmap();
+      if (mapState.allTeams) updateMapOverlay(mapState.allTeams); // hide dots immediately
+    } else {
+      if (mapState.skillsHeatLayer) { mapState.skillsHeatLayer.remove(); mapState.skillsHeatLayer = null; }
+      if (mapState.allTeams) updateMapOverlay(mapState.allTeams); // restore dots if no other heatmap
+    }
+  });
+
   const panel = document.getElementById('map-country-panel');
   panel.classList.add('hidden');
   panel.innerHTML = '';
 
   await loadMapData();
+}
+
+async function fetchProgramSeasons(programId) {
+  if (_seasonListCache[programId]) return _seasonListCache[programId];
+  try {
+    const json = await apiFetch(`/seasons?program[]=${programId}&per_page=25`);
+    const list = (json.data || []).map(s => ({ id: s.id, name: s.name }));
+    _seasonListCache[programId] = list;
+    // Also cache the first (active) id so getActiveSeasonId doesn't re-fetch
+    if (list.length && _seasonIdCache[programId] === undefined) {
+      _seasonIdCache[programId] = list[0].id;
+    }
+    return list;
+  } catch { return []; }
 }
 
 async function getActiveSeasonId(programId) {
@@ -2222,6 +2466,7 @@ async function getActiveSeasonId(programId) {
 // Slim down a team object to only the fields the map needs, to keep the cache small.
 function slimTeam(t) {
   return {
+    id:       t.id,
     number:   t.number,
     name:     t.name,
     grade:    t.grade,
@@ -2231,7 +2476,7 @@ function slimTeam(t) {
 }
 
 // ── Per-program localStorage cache (24 h TTL) ─────────────────────────────
-function _progCacheKey(pid) { return `vexmap_prog_${pid}`; }
+function _progCacheKey(pid) { return `vexmap_prog2_${pid}`; }
 function _readProgCache(pid) {
   try {
     const raw = localStorage.getItem(_progCacheKey(pid));
@@ -2703,6 +2948,7 @@ function renderEventAwards(awards) {
     const info    = AWARD_INFO[type] || AWARD_INFO.other;
     const title   = a?.title || info.icon + ' ' + type;
     const given   = a && (a.teams || []).length > 0;
+    const eventEnded = currentEvent?.end ? new Date(currentEvent.end) < new Date() : false;
     const quals   = a?.qualifications?.length
       ? `<div class="award-qual-tag">Qualifies: ${esc(a.qualifications.join(', '))}</div>` : '';
 
@@ -2887,7 +3133,7 @@ function renderEventAwards(awards) {
             <div class="award-card-name">${esc(a?.title || title)}</div>
             <div class="award-card-desc">${info.desc}</div>
           </div>
-          ${given ? '<span class="award-given-badge">Awarded</span>' : '<span class="award-pending-badge">Pending</span>'}
+          ${given ? '<span class="award-given-badge">Awarded</span>' : eventEnded ? '<span class="award-pending-badge award-not-recorded">Not Recorded</span>' : '<span class="award-pending-badge">Pending</span>'}
         </div>
         ${quals}
         ${winnerHtml}
@@ -2918,14 +3164,15 @@ function renderEventAwards(awards) {
     </div>`;
   }
 
+  const pastEvent = currentEvent?.end ? new Date(currentEvent.end) < new Date() : false;
   html = sortedApiAwards.map(a => renderAwardCard(classifyAward(a.title), a)).join('');
   const givenCount = sortedApiAwards.filter(a => (a.teams || []).length > 0).length;
   const pendingCount = sortedApiAwards.length - givenCount;
   const statusNote = givenCount === sortedApiAwards.length
     ? `All ${givenCount} award${givenCount !== 1 ? 's' : ''} have been announced.`
     : pendingCount === sortedApiAwards.length
-    ? 'No awards announced yet — showing eligible teams based on current standings.'
-    : `${givenCount} awarded · ${pendingCount} pending`;
+    ? (pastEvent ? 'Award winners were not entered in RobotEvents for this event.' : 'No awards announced yet — showing eligible teams based on current standings.')
+    : `${givenCount} awarded · ${pendingCount} ${pastEvent ? 'not recorded' : 'pending'}`;
 
   return `<div class="stats-section">
     <div class="section-title">Awards (${sortedApiAwards.length})</div>
@@ -3080,6 +3327,58 @@ function renderSeasonCards(seasons, counts) {
 // STATS VIEW
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Compute TrueSkill directly from a team's fetched season data.
+// Uses standingsState.data max combined for normalization if available.
+function computeTeamTrueSkill(skills, rankings, awards) {
+  const bestDriver = Math.max(0, ...skills.filter(s => s.type === 'driver').map(s => s.score));
+  const bestProg   = Math.max(0, ...skills.filter(s => s.type === 'programming').map(s => s.score));
+  const combined   = bestDriver + bestProg;
+  if (combined === 0 && !rankings.length) return null;
+
+  const maxCombined = standingsState.data?.length
+    ? Math.max(1, ...standingsState.data.map(t => t.combined))
+    : Math.max(combined, 1);
+
+  const skillsScore  = combined / maxCombined;
+
+  const eventsPlayed = rankings.length;
+  const awardSum     = awards.reduce((s, a) => s + awardWeight(a.title || ''), 0);
+  const awardsNorm   = eventsPlayed > 0 ? Math.min(awardSum / eventsPlayed / 3, 1) : 0;
+
+  let totalRank = 0, wins = 0, matches = 0;
+  for (const r of rankings) {
+    totalRank += r.rank || 0;
+    wins      += r.wins || 0;
+    matches   += (r.wins || 0) + (r.losses || 0) + (r.ties || 0);
+  }
+  const avgRank  = eventsPlayed > 0 ? totalRank / eventsPlayed : 999;
+  const rankNorm = avgRank > 0 ? Math.min(1, 1 / Math.sqrt(avgRank)) : 0;
+  const winNorm  = matches > 0 ? wins / matches : 0;
+
+  return +(10 * (skillsScore * 0.35 + awardsNorm * 0.25 + rankNorm * 0.25 + winNorm * 0.15)).toFixed(2);
+}
+
+// Fetch a team's official world skills rank from the legacy standings endpoint.
+// Checks both regular season and worlds, returns the entry with the best combined score.
+async function fetchTeamWorldSkillsRank(teamNumber, seasonId, grade) {
+  if (!grade) return null;
+  try {
+    const base = `https://www.robotevents.com/api/seasons/${seasonId}/skills` +
+      `?grade_level=${encodeURIComponent(grade)}`;
+    const [regular, worlds] = await Promise.all([
+      fetch(base + '&post_season=0').then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(base + '&post_season=1').then(r => r.ok ? r.json() : []).catch(() => []),
+    ]);
+    const all = [...(Array.isArray(regular) ? regular : []), ...(Array.isArray(worlds) ? worlds : [])];
+    // Find all entries for this team and pick the one with the best combined score
+    const entries = all.filter(e => e.team?.team === teamNumber);
+    if (!entries.length) return null;
+    return entries.reduce((best, e) =>
+      (e.scores?.score || 0) > (best.scores?.score || 0) ? e : best
+    );
+  } catch (_) { return null; }
+}
+
 async function openStatsView(team, season) {
   showView('view-stats');
   document.getElementById('season-hero').innerHTML = `
@@ -3093,36 +3392,41 @@ async function openStatsView(team, season) {
   setStatus('stats', 'Loading stats…');
   try {
     const sid = season.id;
-    const [events, rankings, skills, awards] = await Promise.all([
+    const [events, rankings, skills, awards, worldEntry] = await Promise.all([
       fetchAllPages(`/teams/${team.id}/events?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/awards?season[]=${sid}`),
+      fetchTeamWorldSkillsRank(team.number, sid, team.grade),
     ]);
     clearStatus('stats');
-    renderTeamStats(events, rankings, skills, awards);
+    renderTeamStats(events, rankings, skills, awards, worldEntry);
   } catch (err) {
     setStatus('stats', `Error: ${err.message}`, 'error');
   }
 }
 
-function renderTeamStats(events, rankings, skills, awards) {
+function renderTeamStats(events, rankings, skills, awards, worldEntry) {
   const el = document.getElementById('stats-content');
   const eventMap = {};
   events.forEach(ev => { eventMap[ev.id] = ev; });
 
-  const bestRank      = rankings.length ? Math.min(...rankings.map(r => r.rank)) : null;
-  const driver        = skills.filter(s => s.type === 'driver');
-  const prog          = skills.filter(s => s.type === 'programming');
-  const bestDriver    = driver.length ? Math.max(...driver.map(s => s.score)) : null;
-  const bestProg      = prog.length   ? Math.max(...prog.map(s => s.score))   : null;
-  const _skillRanks = skills.map(s => s.rank).filter(n => n != null && n > 0);
-  const worldSkillsRank = _skillRanks.length ? Math.min(..._skillRanks) : null;
+  const bestRank = rankings.length ? Math.min(...rankings.map(r => r.rank)) : null;
+  const driver   = skills.filter(s => s.type === 'driver');
+  const prog     = skills.filter(s => s.type === 'programming');
+  const bestDriver = driver.length ? Math.max(...driver.map(s => s.score)) : null;
+  const bestProg   = prog.length   ? Math.max(...prog.map(s => s.score))   : null;
+
+  // Prefer world rank from legacy endpoint (includes worlds); fall back to v2 rank field
+  const worldSkillsRank = worldEntry?.rank
+    ?? (skills.map(s => s.rank).filter(n => n != null && n > 0).reduce((a, b) => Math.min(a, b), Infinity) || null);
+
+  const trueSkillScore = computeTeamTrueSkill(skills, rankings, awards);
 
   el.innerHTML = [
-    metricsHTML(events.length, bestRank, worldSkillsRank, awards.length),
+    metricsHTML(events.length, bestRank, worldSkillsRank, awards.length, trueSkillScore),
     teamRankingsHTML(rankings, eventMap),
-    teamSkillsHTML(driver, prog, bestDriver, bestProg),
+    teamSkillsHTML(driver, prog, bestDriver, bestProg, worldEntry),
     teamAwardsHTML(awards),
   ].join('');
 
@@ -3133,7 +3437,7 @@ function renderTeamStats(events, rankings, skills, awards) {
   });
 }
 
-function metricsHTML(evCount, bestRank, worldSkillsRank, awardCount) {
+function metricsHTML(evCount, bestRank, worldSkillsRank, awardCount, trueSkill) {
   const m = (val, label) => `
     <div class="metric-card">
       <div class="metric-value">${val ?? '—'}</div>
@@ -3144,6 +3448,7 @@ function metricsHTML(evCount, bestRank, worldSkillsRank, awardCount) {
     ${m(bestRank ? `#${bestRank}` : null, 'Best Rank')}
     ${m(worldSkillsRank ? `#${worldSkillsRank}` : null, 'World Skills')}
     ${m(awardCount, 'Awards')}
+    ${trueSkill != null ? m(trueSkill.toFixed(2) + '<span style="font-size:.7rem;opacity:.55">/10</span>', 'Rating') : ''}
   </div>`;
 }
 
@@ -3187,30 +3492,36 @@ function teamRankingsHTML(rankings, eventMap) {
     </div>`;
 }
 
-function teamSkillsHTML(driver, prog, bestDriver, bestProg) {
-  if (!driver.length && !prog.length) return `
+function teamSkillsHTML(driver, prog, bestDriver, bestProg, worldEntry) {
+  if (!driver.length && !prog.length && !worldEntry) return `
     <div class="stats-section">
       <div class="section-title">Skills</div>
       <p class="empty">No skills data for this season.</p>
     </div>`;
-  const _dRanks = driver.map(s => s.rank).filter(n => n != null && n > 0);
-  const _pRanks = prog.map(s => s.rank).filter(n => n != null && n > 0);
-  const driverWorldRank = _dRanks.length ? Math.min(..._dRanks) : null;
-  const progWorldRank   = _pRanks.length ? Math.min(..._pRanks) : null;
-  const combined = bestDriver != null && bestProg != null ? bestDriver + bestProg : null;
-  const card = (label, score, worldRank) => score != null ? `
+
+  // Use legacy worldEntry as the authoritative source where available
+  const wDriver  = worldEntry?.scores?.driver      ?? bestDriver;
+  const wProg    = worldEntry?.scores?.programming ?? bestProg;
+  const wCombined = worldEntry?.scores?.score      ?? (wDriver != null && wProg != null ? wDriver + wProg : null);
+  const wRank    = worldEntry?.rank                ?? null;
+  const dStop    = worldEntry?.scores?.driverStopTime  || null;
+  const pStop    = worldEntry?.scores?.progStopTime    || null;
+
+  const stopFmt  = s => (s != null && s > 0) ? ` <span style="font-size:.75rem;color:var(--text-muted)">${s}s</span>` : '';
+  const card = (label, score, stop, worldRank) => score != null ? `
     <div class="skill-card">
       <div class="skill-type">${label}</div>
-      <div class="skill-score">${score}</div>
+      <div class="skill-score">${score}${stopFmt(stop)}</div>
       ${worldRank ? `<div class="skill-rank">World Rank #${worldRank}</div>` : ''}
     </div>` : '';
+
   return `
     <div class="stats-section">
       <div class="section-title">Skills</div>
       <div class="skills-row">
-        ${card('Driver', bestDriver, driverWorldRank)}
-        ${card('Programming', bestProg, progWorldRank)}
-        ${combined != null ? card('Combined', combined, null) : ''}
+        ${card('Driver',      wDriver,   dStop, null)}
+        ${card('Programming', wProg,     pStop, null)}
+        ${card('Combined',    wCombined, null,  wRank)}
       </div>
     </div>`;
 }
@@ -3804,4 +4115,336 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
     '<tbody>' + rowsHtml + '</tbody></table></div></div>';
 
   return { html: summarySection + histSection + graphSection + scheduleSection, sorted };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPARE TEAMS VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+
+const compareState = {
+  slots: [null, null, null, null], // up to 4 team data objects
+};
+
+function openCompareView() {
+  showView('view-compare');
+  renderCompareSearchRow();
+  renderCompareContent();
+}
+
+function renderCompareSearchRow() {
+  const el = document.getElementById('compare-search-row');
+  const filled = compareState.slots.filter(Boolean).length;
+  const canAdd = filled < 4;
+  el.innerHTML = `
+    <div class="compare-add-row">
+      ${canAdd ? `
+        <input id="cmp-input" type="text" class="compare-input" placeholder="Enter team number (e.g. 2397A)" autocomplete="off" />
+        <button id="cmp-add-btn" class="btn-primary">Add Team</button>
+      ` : `<span class="compare-max-note">4 teams added — remove one to add another.</span>`}
+    </div>`;
+  if (canAdd) {
+    const inp = el.querySelector('#cmp-input');
+    const btn = el.querySelector('#cmp-add-btn');
+    btn.addEventListener('click', () => addCompareTeam(inp.value.trim()));
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') addCompareTeam(inp.value.trim()); });
+  }
+}
+
+async function addCompareTeam(number) {
+  if (!number) return;
+  const already = compareState.slots.find(s => s && s.team.number?.toLowerCase() === number.toLowerCase());
+  if (already) {
+    setStatus('compare', `${number} is already in the comparison.`, 'warn'); return;
+  }
+  const filled = compareState.slots.filter(Boolean).length;
+  if (filled >= 4) { setStatus('compare', 'Maximum 4 teams.', 'warn'); return; }
+
+  setStatus('compare', `Loading ${number}…`);
+  try {
+    const json = await apiFetch(`/teams?number[]=${encodeURIComponent(number)}&program[]=1&myTeams=false`);
+    const team = json.data?.[0];
+    if (!team) { setStatus('compare', `Team ${number} not found in V5RC.`, 'error'); return; }
+
+    // Find most recent season
+    const allEvents = await fetchAllPages(`/teams/${team.id}/events`);
+    const seasonMap = {};
+    allEvents.forEach(ev => {
+      if (ev.season && ev.program) {
+        const key = ev.season.id;
+        if (!seasonMap[key]) seasonMap[key] = { ...ev.season, program: ev.program };
+      }
+    });
+    const seasons = Object.values(seasonMap).sort((a, b) => b.id - a.id);
+    const season = seasons[0];
+    if (!season) { setStatus('compare', `No season data for ${number}.`, 'error'); return; }
+
+    const sid = season.id;
+    const [rankings, skills, awards, worldEntry, allMatches] = await Promise.all([
+      fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
+      fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
+      fetchAllPages(`/teams/${team.id}/awards?season[]=${sid}`),
+      fetchTeamWorldSkillsRank(team.number, sid, team.grade),
+      fetchAllPages(`/teams/${team.id}/matches?season[]=${sid}&round[]=2`),
+    ]);
+
+    // Compute per-event OPR from the team's qual matches, then average
+    const matchesByEvent = {};
+    allMatches.forEach(m => {
+      const eid = m.event?.id;
+      if (eid) { (matchesByEvent[eid] = matchesByEvent[eid] || []).push(m); }
+    });
+    const oprValues = [];
+    Object.values(matchesByEvent).forEach(evMatches => {
+      const opr = computeOPR(evMatches);
+      const entry = opr[team.number];
+      if (entry?.opr != null && entry.opr > 0) oprValues.push(entry.opr);
+    });
+    const avgOPR = oprValues.length ? oprValues.reduce((a, b) => a + b, 0) / oprValues.length : null;
+
+    const slot = {
+      team,
+      season,
+      eventsPlayed: allEvents.filter(e => e.season?.id === sid).length,
+      rankings,
+      skills,
+      awards,
+      worldEntry,
+      avgOPR,
+    };
+
+    // Place in first empty slot
+    const idx = compareState.slots.findIndex(s => s === null);
+    compareState.slots[idx] = slot;
+    clearStatus('compare');
+    renderCompareSearchRow();
+    renderCompareContent();
+  } catch (err) {
+    setStatus('compare', `Error loading ${number}: ${err.message}`, 'error');
+  }
+}
+
+function removeCompareSlot(idx) {
+  compareState.slots[idx] = null;
+  renderCompareSearchRow();
+  renderCompareContent();
+}
+
+function renderCompareContent() {
+  const el = document.getElementById('compare-content');
+  const slots = compareState.slots.filter(Boolean);
+  if (!slots.length) {
+    el.innerHTML = '<p class="empty compare-empty">Add a team above to start comparing.</p>';
+    return;
+  }
+
+  // ── Per-slot derived stats
+  const derived = compareState.slots.map((s, i) => {
+    if (!s) return null;
+    const { team, rankings, skills, awards, worldEntry, eventsPlayed, avgOPR } = s;
+
+    const driver = skills.filter(x => x.type === 'driver');
+    const prog   = skills.filter(x => x.type === 'programming');
+    const bestDriver = driver.length ? Math.max(...driver.map(x => x.score)) : null;
+    const bestProg   = prog.length   ? Math.max(...prog.map(x => x.score))   : null;
+    const combined   = (bestDriver || 0) + (bestProg || 0);
+
+    const wins   = rankings.reduce((a, r) => a + (r.wins   || 0), 0);
+    const losses = rankings.reduce((a, r) => a + (r.losses || 0), 0);
+    const ties   = rankings.reduce((a, r) => a + (r.ties   || 0), 0);
+    const total  = wins + losses + ties;
+    const winRate = total > 0 ? wins / total : null;
+    const avgRank = rankings.length
+      ? rankings.reduce((a, r) => a + (r.rank || 0), 0) / rankings.length
+      : null;
+    const bestRank = rankings.length ? Math.min(...rankings.map(r => r.rank)) : null;
+
+    // Auton = average AP per match across all events
+    const totalAP      = rankings.reduce((a, r) => a + (r.ap || 0), 0);
+    const avgAPPerMatch = total > 0 ? totalAP / total : null;
+
+    const worldRank = worldEntry?.rank ?? null;
+
+    const rating = computeTeamTrueSkill(skills, rankings, awards);
+    const awardsPerEvent = eventsPlayed > 0 ? awards.length / eventsPlayed : null;
+
+    const excellenceCount = awards.filter(a => /excellence/i.test(a.title || '')).length;
+    const championCount   = awards.filter(a => /champion/i.test(a.title || '')).length;
+
+    return { i, team, eventsPlayed, bestDriver, bestProg, combined, wins, losses, ties, winRate,
+      avgRank, bestRank, worldRank, rating, awards, awardsPerEvent, excellenceCount, championCount,
+      avgOPR, avgAPPerMatch };
+  });
+
+  const active = derived.filter(Boolean);
+
+  // Best-value helpers for highlighting
+  function bestIdx(key, lower = false) {
+    let best = null, bestVal = lower ? Infinity : -Infinity;
+    active.forEach(d => {
+      const v = d[key];
+      if (v == null) return;
+      if (lower ? v < bestVal : v > bestVal) { bestVal = v; best = d.i; }
+    });
+    return best;
+  }
+
+  const bestRating   = bestIdx('rating');
+  const bestCombined   = bestIdx('combined');
+  const bestWinRate    = bestIdx('winRate');
+  const bestWorldRank  = bestIdx('worldRank', true);
+  const bestRankIdx    = bestIdx('bestRank', true);
+  const bestOPR        = bestIdx('avgOPR');
+  const bestAuton      = bestIdx('avgAPPerMatch');
+  const bestAwardsPerE = bestIdx('awardsPerEvent');
+
+  // ── Radar charts (one per filled slot)
+  const RADAR_AXES = ['Win Rate', 'Avg OPR', 'Avg Rank', 'Skills', 'Auton', 'Awards/Evt'];
+  function radarNorm(key, lower = false) {
+    const vals = active.map(d => d[key]).filter(v => v != null && v > 0);
+    const max = vals.length ? Math.max(...vals) : 1;
+    return d => {
+      const v = d[key];
+      if (v == null || max === 0) return 0;
+      return lower ? Math.max(0, 1 - (v - Math.min(...vals)) / (max - Math.min(...vals) || 1))
+                   : v / max;
+    };
+  }
+  const normFns = [
+    radarNorm('winRate'),
+    radarNorm('avgOPR'),
+    radarNorm('avgRank', true),   // lower rank # = better
+    radarNorm('combined'),
+    radarNorm('avgAPPerMatch'),
+    radarNorm('awardsPerEvent'),
+  ];
+
+  const SLOT_COLORS = ['#E8854A', '#3B82F6', '#22C55E', '#A855F7'];
+
+  function renderRadar(d, color) {
+    const N = RADAR_AXES.length;
+    const R = 70, CX = 90, CY = 85;
+    const angle = i => (i / N) * 2 * Math.PI - Math.PI / 2;
+    const pt = (r, i) => [CX + r * Math.cos(angle(i)), CY + r * Math.sin(angle(i))];
+
+    // Grid rings
+    let grid = '';
+    for (let ring = 1; ring <= 4; ring++) {
+      const r = (ring / 4) * R;
+      const pts = Array.from({ length: N }, (_, i) => pt(r, i).join(',')).join(' ');
+      grid += `<polygon points="${pts}" fill="none" stroke="var(--border)" stroke-width="0.7"/>`;
+    }
+    // Spokes + labels
+    let spokes = '';
+    RADAR_AXES.forEach((label, i) => {
+      const [x1, y1] = pt(R, i);
+      const [lx, ly] = pt(R + 14, i);
+      spokes += `<line x1="${CX}" y1="${CY}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="var(--border)" stroke-width="0.8"/>`;
+      spokes += `<text x="${lx.toFixed(1)}" y="${(ly + 3).toFixed(1)}" text-anchor="middle" font-size="7" fill="var(--text-muted)">${label}</text>`;
+    });
+    // Data polygon
+    const scores = normFns.map(fn => fn(d));
+    const dataPts = scores.map((s, i) => pt(s * R, i).join(',')).join(' ');
+
+    return `<svg viewBox="0 0 180 175" class="radar-svg">
+      ${grid}${spokes}
+      <polygon points="${dataPts}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-width="1.5"/>
+      ${scores.map((s, i) => { const [x, y] = pt(s * R, i); return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5" fill="${color}"/>`; }).join('')}
+    </svg>`;
+  }
+
+  const radarCards = compareState.slots.map((s, i) => {
+    if (!s) return '';
+    const d = derived[i];
+    return `<div class="cmp-radar-card">
+      <div class="cmp-radar-label">${esc(d.team.number || d.team.name || '?')}</div>
+      ${renderRadar(d, SLOT_COLORS[i])}
+    </div>`;
+  }).join('');
+
+  // ── Team header cards
+  const headers = compareState.slots.map((s, i) => {
+    if (!s) return `<div class="cmp-col cmp-col-empty"><div class="cmp-slot-empty">—</div></div>`;
+    const d = derived[i];
+    const prog = s.season?.program?.name || '';
+    return `
+      <div class="cmp-col">
+        <div class="cmp-team-header">
+          <div class="cmp-team-num">${esc(d.team.number || d.team.name || '?')}</div>
+          <div class="cmp-team-name">${esc(d.team.team_name || d.team.organization || '')}</div>
+          <div class="cmp-team-meta">${esc(d.team.location?.city || d.team.city || '')}${d.team.location?.country || d.team.country ? ' · ' + esc(d.team.location?.country || d.team.country || '') : ''}</div>
+          <div class="cmp-team-season">${esc(s.season.name)} · ${esc(prog)}</div>
+          <button class="cmp-remove-btn" data-slot="${i}">✕ Remove</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  // ── Stat rows
+  function row(label, vals, unit = '') {
+    const cells = compareState.slots.map((_, i) => {
+      const d = derived[i];
+      if (!d) return `<td class="cmp-cell cmp-empty">—</td>`;
+      const v = vals(d);
+      return `<td class="cmp-cell">${v != null ? v + unit : '—'}</td>`;
+    }).join('');
+    return `<tr><th class="cmp-row-label">${label}</th>${cells}</tr>`;
+  }
+
+  function rowHi(label, vals, bestSlot) {
+    const cells = compareState.slots.map((_, i) => {
+      const d = derived[i];
+      if (!d) return `<td class="cmp-cell cmp-empty">—</td>`;
+      const v = vals(d);
+      const cls = (v != null && d.i === bestSlot) ? ' cmp-best' : '';
+      return `<td class="cmp-cell${cls}">${v != null ? v : '—'}</td>`;
+    }).join('');
+    return `<tr><th class="cmp-row-label">${label}</th>${cells}</tr>`;
+  }
+
+  const tableRows = [
+    rowHi('Rating',          d => d.rating != null ? d.rating.toFixed(2) + '<span class="cmp-unit">/10</span>' : null, bestRating),
+    row('Season',            d => esc(d.team.grade || '')),
+    row('Events Played',     d => d.eventsPlayed),
+    rowHi('Best Rank',       d => d.bestRank != null ? '#' + d.bestRank : null,           bestRankIdx),
+    rowHi('Avg Rank',        d => d.avgRank  != null ? '#' + d.avgRank.toFixed(1) : null, bestRankIdx),
+    rowHi('Win Rate',        d => d.winRate  != null ? Math.round(d.winRate * 100) + '%' : null, bestWinRate),
+    row('Record (W–L–T)',    d => `${d.wins}–${d.losses}–${d.ties}`),
+    rowHi('Avg OPR',         d => d.avgOPR   != null ? d.avgOPR.toFixed(1) : null,        bestOPR),
+    rowHi('Auton (AP/match)',d => d.avgAPPerMatch != null ? d.avgAPPerMatch.toFixed(2) : null, bestAuton),
+    rowHi('World Skills',    d => d.worldRank != null ? '#' + d.worldRank : null,          bestWorldRank),
+    rowHi('Combined Skills', d => d.combined > 0 ? d.combined : null,                     bestCombined),
+    rowHi('Best Driver',     d => d.bestDriver,                                            bestIdx('bestDriver')),
+    rowHi('Best Prog.',      d => d.bestProg,                                              bestIdx('bestProg')),
+    rowHi('Awards/Event',    d => d.awardsPerEvent != null ? d.awardsPerEvent.toFixed(2) : null, bestAwardsPerE),
+    row('Total Awards',      d => d.awards.length),
+    row('Excellence',        d => d.excellenceCount || '—'),
+    row('Championships',     d => d.championCount  || '—'),
+  ].join('');
+
+  el.innerHTML = `
+    <div class="cmp-radar-row">${radarCards}</div>
+    <div class="cmp-table-wrap">
+      <table class="cmp-table">
+        <thead>
+          <tr>
+            <th class="cmp-row-label"></th>
+            ${compareState.slots.map(s =>
+              s ? `<th class="cmp-col-head">${esc(s.team.number || s.team.name || '?')}</th>`
+                : `<th class="cmp-col-head cmp-empty">Empty</th>`
+            ).join('')}
+          </tr>
+        </thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>
+    <div class="cmp-cards-row">${headers}</div>`;
+
+  // Wire remove buttons
+  el.querySelectorAll('.cmp-remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => removeCompareSlot(+btn.dataset.slot));
+  });
+
+  // Wire team number header links
+  el.querySelectorAll('.cmp-team-num[data-num]').forEach(btn => {
+    btn.addEventListener('click', () => goToTeam(btn.dataset.num));
+  });
 }

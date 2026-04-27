@@ -12,7 +12,7 @@
 </head>
 <body>
   <header class="site-header">
-    <span class="logo">TUFF Scout</span>
+    <span class="logo">idk scouting</span>
     <label class="theme-switch-wrap" title="Toggle dark mode" aria-label="Toggle dark mode">
       <span class="theme-icon">☀︎</span>
       <span class="toggle-switch">
@@ -37,6 +37,7 @@
         <button class="tab" data-tab="event">Browse Events</button>
         <button class="tab" data-tab="standings">Standings</button>
         <button class="tab" data-tab="map" id="map-nav-btn">Explore Teams</button>
+        <button class="tab" data-tab="compare">Compare Teams</button>
       </div>
 
       <!-- Team search panel -->
@@ -102,6 +103,18 @@
       <div id="standings-filters"></div>
       <div id="standings-status" class="status hidden"></div>
       <div id="standings-content"></div>
+    </div>
+
+    <!-- ── Compare Teams view ── -->
+    <div id="view-compare" class="view hidden">
+      <button class="back-btn" id="back-from-compare">← Back</button>
+      <div class="page-heading">
+        <h1>Compare Teams</h1>
+        <p class="page-sub">Add up to 4 teams to compare stats side by side.</p>
+      </div>
+      <div id="compare-search-row"></div>
+      <div id="compare-status" class="status hidden"></div>
+      <div id="compare-content"></div>
     </div>
 
     <!-- ── World Map view ── -->

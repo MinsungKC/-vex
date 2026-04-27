@@ -1227,3 +1227,111 @@ tbody tr:hover td { background: var(--bg); }
   height: 100%; background: var(--accent); border-radius: 2px;
   transition: width .3s ease;
 }
+
+/* ── Compare Teams view ── */
+.compare-add-row {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;
+}
+.compare-input {
+  flex: 1; min-width: 180px; max-width: 280px;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); color: var(--text); font-family: inherit; font-size: .9rem;
+}
+.compare-max-note {
+  font-size: .85rem; color: var(--text-muted);
+}
+.compare-empty {
+  margin-top: 32px; text-align: center;
+}
+.cmp-table-wrap {
+  overflow-x: auto; margin-bottom: 24px;
+}
+.cmp-table {
+  width: 100%; border-collapse: collapse; font-size: .85rem;
+}
+.cmp-table thead th {
+  padding: 8px 14px; background: var(--card, var(--surface)); border-bottom: 2px solid var(--border);
+  font-size: .8rem; font-weight: 700; color: var(--text-muted); text-align: center;
+  white-space: nowrap;
+}
+.cmp-table thead th.cmp-col-head {
+  color: var(--accent); font-size: .95rem; font-weight: 700;
+}
+.cmp-table thead th.cmp-col-head.cmp-empty {
+  color: var(--text-muted); font-weight: 400;
+}
+.cmp-row-label {
+  padding: 7px 14px; text-align: left; font-weight: 600; font-size: .78rem;
+  color: var(--text-muted); white-space: nowrap; background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.cmp-cell {
+  padding: 7px 14px; text-align: center; border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.cmp-cell.cmp-empty { color: var(--text-muted); }
+.cmp-cell.cmp-best {
+  color: var(--accent); font-weight: 700; background: var(--accent-bg);
+}
+.cmp-unit {
+  font-size: .7rem; opacity: .55; margin-left: 1px;
+}
+.cmp-table tbody tr:hover .cmp-row-label,
+.cmp-table tbody tr:hover .cmp-cell { background: var(--accent-bg); }
+.cmp-table tbody tr:hover .cmp-cell.cmp-best { background: var(--accent-bg); }
+
+.cmp-cards-row {
+  display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px;
+}
+.cmp-col {
+  flex: 1; min-width: 180px;
+}
+.cmp-col-empty {
+  flex: 1; min-width: 180px;
+}
+.cmp-slot-empty {
+  border: 2px dashed var(--border); border-radius: 12px;
+  min-height: 120px; display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: .9rem;
+}
+.cmp-team-header {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px 16px;
+}
+.cmp-team-num {
+  font-size: 1.1rem; font-weight: 700; color: var(--accent); margin-bottom: 2px;
+}
+.cmp-team-name {
+  font-size: .85rem; font-weight: 600; color: var(--text); margin-bottom: 2px;
+}
+.cmp-team-meta {
+  font-size: .75rem; color: var(--text-muted); margin-bottom: 2px;
+}
+.cmp-team-season {
+  font-size: .72rem; color: var(--text-muted); margin-bottom: 10px;
+}
+.cmp-remove-btn {
+  padding: 3px 10px; font-size: .75rem; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: none; color: var(--text-muted);
+  font-family: inherit; transition: all .15s;
+}
+.cmp-remove-btn:hover { background: var(--red-bg); color: var(--red); border-color: var(--red); }
+
+/* ── Radar charts ── */
+.cmp-radar-row {
+  display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; justify-content: center;
+}
+.cmp-radar-card {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.cmp-radar-label {
+  font-size: .82rem; font-weight: 700; color: var(--text);
+}
+.radar-svg {
+  width: 180px; height: 175px; overflow: visible;
+}
+
+/* Not-recorded badge for past event awards */
+.award-not-recorded {
+  background: var(--bg); color: var(--text-muted); border: 1px solid var(--border);
+}

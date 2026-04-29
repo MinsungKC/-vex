@@ -34,7 +34,201 @@ let cachedPriorExcellenceSet = null; // Set of team numbers who won Excellence a
 let currentTeamAtEvent  = null;
 let pendingHighlightTeam = null; // team number to highlight after rankings load
 let predWeights         = JSON.parse(localStorage.getItem('predWeights') || 'null') || { opr: 50, ranking: 25, skills: 25 };
+let predTuning          = JSON.parse(localStorage.getItem('predTuning')  || 'null') || {
+  wOPR: 1.0, wCCWM: 0.3, wDPR: 0.2, wWR: 0.3,
+  wSkills: 0.1, wConsist: 0.1, wForm: 0.2, tanhScale: 0.22,
+};
+let _predStatCache = null; // invalidated when event data changes
 let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions') || 'false');
+
+// ── Watchlist ──────────────────────────────────────────────────────────────
+// watchlist: { teams: { [number]: { name, program } }, events: { [id]: { name, sku } } }
+// snapshots: { teams: { [number]: { lastRank, lastAwards, ts } }, events: { [id]: { lastAwards, lastMatches, ts } } }
+// notifications: [ { id, ts, text, link, type } ]
+
+function getWatchlist() {
+  try { return JSON.parse(localStorage.getItem('watchlist') || 'null') || { teams: {}, events: {} }; } catch (_) { return { teams: {}, events: {} }; }
+}
+function saveWatchlist(wl) { localStorage.setItem('watchlist', JSON.stringify(wl)); }
+function getSnapshots() {
+  try { return JSON.parse(localStorage.getItem('wl_snapshots') || 'null') || { teams: {}, events: {} }; } catch (_) { return { teams: {}, events: {} }; }
+}
+function saveSnapshots(s) { localStorage.setItem('wl_snapshots', JSON.stringify(s)); }
+function getNotifications() {
+  try { return JSON.parse(localStorage.getItem('wl_notifications') || '[]'); } catch (_) { return []; }
+}
+function saveNotifications(ns) { localStorage.setItem('wl_notifications', JSON.stringify(ns.slice(0, 50))); }
+function addNotification(text, type = 'info') {
+  const ns = getNotifications();
+  ns.unshift({ id: Date.now() + Math.random(), ts: Date.now(), text, type });
+  saveNotifications(ns);
+  updateNotifBadge();
+}
+
+function followTeam(number, name, program) {
+  const wl = getWatchlist();
+  wl.teams[number] = { name, program };
+  saveWatchlist(wl);
+  updateFollowButtons();
+}
+function unfollowTeam(number) {
+  const wl = getWatchlist();
+  delete wl.teams[number];
+  saveWatchlist(wl);
+  updateFollowButtons();
+}
+function isFollowingTeam(number) { return !!getWatchlist().teams[number]; }
+
+function followEvent(id, name, sku) {
+  const wl = getWatchlist();
+  wl.events[id] = { name, sku };
+  saveWatchlist(wl);
+  updateFollowButtons();
+}
+function unfollowEvent(id) {
+  const wl = getWatchlist();
+  delete wl.events[id];
+  saveWatchlist(wl);
+  updateFollowButtons();
+}
+function isFollowingEvent(id) { return !!getWatchlist().events[String(id)]; }
+
+function updateFollowButtons() {
+  document.querySelectorAll('.follow-team-btn[data-num]').forEach(btn => {
+    const following = isFollowingTeam(btn.dataset.num);
+    btn.textContent = following ? 'Following ★' : 'Follow ☆';
+    btn.classList.toggle('following', following);
+  });
+  document.querySelectorAll('.follow-event-btn[data-eid]').forEach(btn => {
+    const following = isFollowingEvent(btn.dataset.eid);
+    btn.textContent = following ? 'Following ★' : 'Follow ☆';
+    btn.classList.toggle('following', following);
+  });
+}
+
+function updateNotifBadge() {
+  const ns = getNotifications();
+  const lastSeen = +localStorage.getItem('notif_last_seen') || 0;
+  const unseen = ns.filter(n => n.ts > lastSeen).length;
+  const badge = document.getElementById('notif-badge');
+  if (badge) {
+    badge.textContent = unseen > 0 ? (unseen > 9 ? '9+' : unseen) : '';
+    badge.style.display = unseen > 0 ? '' : 'none';
+  }
+}
+
+function openNotifPanel() {
+  localStorage.setItem('notif_last_seen', Date.now());
+  updateNotifBadge();
+  const panel = document.getElementById('notif-panel');
+  if (!panel) return;
+  const wl = getWatchlist();
+  const ns = getNotifications();
+  const teamEntries = Object.entries(wl.teams);
+  const eventEntries = Object.entries(wl.events);
+
+  panel.innerHTML = `
+    <div class="notif-panel-inner">
+      <div class="notif-header">
+        <span class="notif-title">Notifications</span>
+        <button class="notif-clear-btn" id="notif-clear">Clear all</button>
+        <button class="notif-close-btn" id="notif-close">✕</button>
+      </div>
+      ${ns.length === 0 ? '<div class="notif-empty">No notifications yet.</div>' :
+        ns.map(n => `
+          <div class="notif-item notif-${n.type}">
+            <span class="notif-text">${esc(n.text)}</span>
+            <span class="notif-ts">${timeAgo(n.ts)}</span>
+          </div>`).join('')}
+      <div class="notif-section-title">Watchlist</div>
+      ${teamEntries.length === 0 && eventEntries.length === 0 ? '<div class="notif-empty">No followed teams or events.</div>' : ''}
+      ${teamEntries.map(([num, t]) => `
+        <div class="notif-wl-item">
+          <span>Team <strong>${esc(num)}</strong> — ${esc(t.name||'')}</span>
+          <button class="notif-unfollow" data-type="team" data-id="${esc(num)}">Unfollow</button>
+        </div>`).join('')}
+      ${eventEntries.map(([id, ev]) => `
+        <div class="notif-wl-item">
+          <span>Event <strong>${esc(ev.sku||id)}</strong> — ${esc(ev.name||'')}</span>
+          <button class="notif-unfollow" data-type="event" data-id="${esc(id)}">Unfollow</button>
+        </div>`).join('')}
+    </div>`;
+
+  panel.classList.remove('hidden');
+  document.getElementById('notif-close')?.addEventListener('click', () => panel.classList.add('hidden'));
+  document.getElementById('notif-clear')?.addEventListener('click', () => {
+    saveNotifications([]);
+    localStorage.setItem('notif_last_seen', Date.now());
+    updateNotifBadge();
+    openNotifPanel();
+  });
+  panel.querySelectorAll('.notif-unfollow').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.type === 'team') unfollowTeam(btn.dataset.id);
+      else unfollowEvent(btn.dataset.id);
+      openNotifPanel();
+    });
+  });
+}
+
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+// Check watched teams/events for updates on startup (fire and forget)
+async function checkWatchlistUpdates() {
+  const wl = getWatchlist();
+  const snap = getSnapshots();
+  const teamNums = Object.keys(wl.teams);
+  const eventIds = Object.keys(wl.events);
+  if (!teamNums.length && !eventIds.length) return;
+
+  // Check teams: look for ranking/awards changes
+  for (const num of teamNums) {
+    try {
+      const teamData = await apiFetch(`/teams?number[]=${encodeURIComponent(num)}&per_page=1`);
+      const team = teamData.data?.[0];
+      if (!team) continue;
+      const awards = await apiFetch(`/teams/${team.id}/awards?per_page=10`);
+      const awardNames = (awards.data || []).map(a => a.title).sort().join('|');
+      const prev = snap.teams[num];
+      if (prev) {
+        if (prev.lastAwards && prev.lastAwards !== awardNames) {
+          addNotification(`Team ${num} has new award activity!`, 'award');
+        }
+      }
+      snap.teams[num] = { lastAwards: awardNames, ts: Date.now() };
+    } catch (_) { /* ignore API errors during background check */ }
+  }
+
+  // Check events: look for new match results or awards
+  for (const eid of eventIds) {
+    try {
+      await apiFetch(`/events/${eid}?per_page=1`);
+      const matchData = await apiFetch(`/events/${eid}/matches?per_page=50`);
+      const scoredCount = (matchData.data || []).filter(matchIsScored).length;
+      const awards = await apiFetch(`/events/${eid}/awards?per_page=10`);
+      const awardCount = (awards.data || []).length;
+      const prev = snap.events[eid];
+      if (prev) {
+        if (scoredCount > (prev.scoredCount || 0)) {
+          addNotification(`${wl.events[eid].name || 'Event'}: ${scoredCount - prev.scoredCount} new match result(s) posted`, 'match');
+        }
+        if (awardCount > (prev.awardCount || 0)) {
+          addNotification(`${wl.events[eid].name || 'Event'}: awards updated!`, 'award');
+        }
+      }
+      snap.events[eid] = { scoredCount, awardCount, ts: Date.now() };
+    } catch (_) { /* ignore */ }
+  }
+
+  saveSnapshots(snap);
+  updateNotifBadge();
+}
 
 // ── Dark / light theme ────────────────────────────────────────────────────
 (function initTheme() {
@@ -52,6 +246,26 @@ let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions
         localStorage.setItem('theme', dark ? 'dark' : 'light');
       });
     }
+
+    // Notification bell
+    const bell = document.getElementById('notif-bell');
+    const panel = document.getElementById('notif-panel');
+    if (bell) {
+      updateNotifBadge();
+      bell.addEventListener('click', e => {
+        e.stopPropagation();
+        if (panel.classList.contains('hidden')) openNotifPanel();
+        else panel.classList.add('hidden');
+      });
+    }
+    document.addEventListener('click', e => {
+      if (panel && !panel.contains(e.target) && e.target !== bell) {
+        panel.classList.add('hidden');
+      }
+    });
+
+    // Background watchlist update check (fire and forget)
+    setTimeout(() => checkWatchlistUpdates(), 2000);
   });
 })();
 
@@ -99,9 +313,10 @@ async function fetchAllPages(path) {
 }
 
 // ── View routing ───────────────────────────────────────────────────────────
-const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings', 'view-compare'];
+const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings', 'view-compare', 'view-live'];
 function showView(id) {
   VIEWS.forEach(v => document.getElementById(v).classList.toggle('hidden', v !== id));
+  if (id !== 'view-live') stopLivePolling();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -114,6 +329,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (which === 'map') { openMapView(); return; }
     if (which === 'standings') { openStandingsView(); return; }
     if (which === 'compare') { openCompareView(); return; }
+    if (which === 'live') { openLiveView(); return; }
     document.getElementById('panel-team').classList.toggle('hidden', which !== 'team');
     document.getElementById('panel-event').classList.toggle('hidden', which !== 'event');
     if (which === 'event') onEventTabActivated();
@@ -144,6 +360,13 @@ document.getElementById('back-from-standings').addEventListener('click', () => {
   document.getElementById('panel-event').classList.add('hidden');
 });
 document.getElementById('back-from-compare').addEventListener('click', () => {
+  showView('view-search');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-tab="team"]')?.classList.add('active');
+  document.getElementById('panel-team').classList.remove('hidden');
+  document.getElementById('panel-event').classList.add('hidden');
+});
+document.getElementById('back-from-live').addEventListener('click', () => {
   showView('view-search');
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="team"]')?.classList.add('active');
@@ -317,6 +540,7 @@ async function openEventDetail(ev) {
   cachedEventMatches     = [];
   cachedOPR              = {};
   cachedSeasonOPR        = {};
+  _predStatCache         = null;
   cachedEventRankings    = {};
   cachedEventSkills      = {};
   cachedAwardsData       = [];
@@ -336,14 +560,28 @@ function renderEventHero(ev) {
   const date  = start === end ? start : `${start} – ${end}`;
   const loc   = [ev.location?.venue, ev.location?.city, ev.location?.region, ev.location?.country]
     .filter(Boolean).join(', ') || '—';
-  document.getElementById('event-detail-hero').innerHTML = `
+  const following = isFollowingEvent(ev.id);
+  const heroEl = document.getElementById('event-detail-hero');
+  heroEl.innerHTML = `
     <div class="event-hero">
       <div class="event-hero-name">${esc(ev.name)}</div>
       <div class="event-hero-meta">
         ${mf('Date', date)} ${mf('Location', loc)} ${mf('Program', ev.program?.name || '—')}
         ${mf('Season', ev.season?.name || '—')} ${mf('Level', ev.level || '—')} ${mf('Code', ev.sku || '—')}
       </div>
+      <button class="follow-event-btn ${following ? 'following' : ''}" data-eid="${ev.id}" data-name="${esc(ev.name)}" data-sku="${esc(ev.sku||'')}">
+        ${following ? 'Following ★' : 'Follow ☆'}
+      </button>
     </div>`;
+  heroEl.querySelector('.follow-event-btn')?.addEventListener('click', () => {
+    if (isFollowingEvent(ev.id)) {
+      unfollowEvent(ev.id);
+    } else {
+      followEvent(ev.id, ev.name, ev.sku || '');
+      addNotification(`Now following ${ev.name}`, 'info');
+    }
+    updateFollowButtons();
+  });
 }
 
 function renderDivisionSelector(divisions) {
@@ -363,6 +601,7 @@ function renderDivisionSelector(divisions) {
       el.querySelectorAll('.div-pill').forEach(b => b.classList.toggle('active', +b.dataset.id === activeDiv));
       cachedEventMatches     = [];
       cachedOPR              = {};
+      _predStatCache         = null;
       cachedSeasonOPR        = {};
       cachedEventRankings    = {};
       cachedEventSkills      = {};
@@ -378,7 +617,10 @@ function renderDetailTabBar() {
   const tabs = [
     { id: 'rankings', label: 'Rankings' },
     { id: 'matches',  label: 'Matches'  },
+    { id: 'bracket',  label: 'Bracket'  },
     { id: 'simulate', label: 'Sim'      },
+    { id: 'picklist', label: 'Pick List'},
+    { id: 'draft',    label: 'Draft Sim'},
     { id: 'awards',   label: 'Awards'   },
     { id: 'skills',   label: 'Skills'   },
     { id: 'teams',    label: 'Teams'    },
@@ -435,6 +677,54 @@ function attachWeightListeners(el, onUpdate) {
   });
 }
 
+// Grid-search over (ccwmW, tanhScale) to maximise win-direction accuracy
+// on completed matches. Returns { ccwmW, tanhScale, accuracy, curve }.
+function autoTunePredictions() {
+  const played = cachedEventMatches.filter(m => m.round === 2 && matchIsScored(m));
+  if (played.length < 5) return null;
+
+  const ccwmVals  = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5];
+  const tanhVals  = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40];
+
+  let bestAcc = -1, bestCCWM = predTuning.ccwmW, bestTanh = predTuning.tanhScale;
+  const curve = []; // { ccwmW, acc } for the best tanhScale per ccwmW
+
+  function evalAccuracy() {
+    let correct = 0, total = 0;
+    for (const m of played) {
+      const pred = predictMatch(m);
+      if (!pred) continue;
+      const all = m.alliances || [];
+      const red  = all.find(a => a.color === 'red');
+      const blue = all.find(a => a.color === 'blue');
+      if (!red || !blue || red.score == null || blue.score == null) continue;
+      const actual = red.score > blue.score ? 'red' : blue.score > red.score ? 'blue' : 'tie';
+      if (pred.winner === actual) correct++;
+      total++;
+    }
+    return total > 0 ? correct / total : 0;
+  }
+
+  for (const cw of ccwmVals) {
+    predTuning.ccwmW = cw;
+    let bestAccForCCWM = -1;
+    for (const ts of tanhVals) {
+      predTuning.tanhScale = ts;
+      const acc = evalAccuracy();
+      if (acc > bestAccForCCWM) bestAccForCCWM = acc;
+      if (acc > bestAcc) {
+        bestAcc = acc; bestCCWM = cw; bestTanh = ts;
+      }
+    }
+    curve.push({ ccwmW: cw, acc: bestAccForCCWM });
+  }
+
+  predTuning.ccwmW = bestCCWM;
+  predTuning.tanhScale = bestTanh;
+  localStorage.setItem('predTuning', JSON.stringify(predTuning));
+  return { ccwmW: bestCCWM, tanhScale: bestTanh, accuracy: Math.round(bestAcc * 100), curve };
+}
+
 function attachMatchTabListeners(el) {
   // Prediction show/hide toggle
   const showToggle = el.querySelector('#pred-show-toggle');
@@ -447,6 +737,46 @@ function attachMatchTabListeners(el) {
     });
   }
   attachWeightListeners(el, () => reRenderMatchContainer(el));
+
+  const autoTuneBtn = el.querySelector('#pred-autotune-btn');
+  if (autoTuneBtn) {
+    autoTuneBtn.addEventListener('click', () => {
+      autoTuneBtn.textContent = '🧪 Tuning…';
+      autoTuneBtn.disabled = true;
+      setTimeout(() => {
+        const result = autoTunePredictions();
+        const resultEl = el.querySelector('#autotune-result');
+        const wBody = el.querySelector('#pred-weights-body');
+        if (!result) {
+          if (resultEl) resultEl.innerHTML = '<p class="tune-msg">Need ≥5 played matches to tune.</p>';
+          autoTuneBtn.textContent = '🧪 Auto-Tune';
+          autoTuneBtn.disabled = false;
+          return;
+        }
+        // Render small accuracy curve
+        const maxAcc = Math.max(...result.curve.map(c => c.acc));
+        const barItems = result.curve.map(c => {
+          const pct = maxAcc > 0 ? (c.acc / maxAcc) * 100 : 0;
+          const isBest = c.ccwmW === result.ccwmW;
+          return '<div class="tune-bar-wrap" title="CCWM×' + c.ccwmW + ': ' + Math.round(c.acc * 100) + '%">' +
+            '<div class="tune-bar' + (isBest ? ' tune-bar-best' : '') + '" style="height:' + Math.round(pct) + '%"></div>' +
+            '<span class="tune-bar-label">' + c.ccwmW + '</span></div>';
+        }).join('');
+        if (resultEl) resultEl.innerHTML =
+          '<div class="tune-result">' +
+          '<div class="tune-summary">Best: CCWM×<strong>' + result.ccwmW + '</strong> · curve <strong>' + result.tanhScale + '</strong> → <strong>' + result.accuracy + '%</strong> accuracy</div>' +
+          '<div class="tune-bars">' + barItems + '</div>' +
+          '</div>';
+        // Keep weights panel open
+        if (wBody) wBody.classList.remove('hidden');
+        autoTuneBtn.textContent = '🧪 Auto-Tune ✓';
+        autoTuneBtn.classList.add('active');
+        autoTuneBtn.disabled = false;
+        reRenderMatchContainer(el);
+      }, 0);
+    });
+  }
+
   // Team links
   el.querySelectorAll('.team-link[data-num]').forEach(btn => {
     btn.addEventListener('click', e => {
@@ -565,11 +895,8 @@ async function loadPriorAwardData() {
         //   award.teams   → [{ team: { name }, division }]  (structured)
         //   award.winners → ["8838E", "PersonName", ...]    (flat strings)
         const names = new Set();
-        for (const t of (award.teams || [])) {
+        for (const t of (award.teamWinners || [])) {
           if (t.team?.name) names.add(t.team.name);
-        }
-        for (const w of (award.winners || [])) {
-          if (w && /^\d+[A-Za-z]?$/.test(w.trim())) names.add(w.trim());
         }
 
         for (const name of names) {
@@ -645,7 +972,7 @@ async function loadEventTabContent() {
       case 'matches': {
         if (!did) { html = '<p class="empty">No divisions found.</p>'; break; }
         cachedEventMatches = await fetchAllPages(`/events/${eid}/divisions/${did}/matches`);
-        cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2));
+        cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
         // Load season OPR in background if current event has no scored quals yet
         if (!Object.keys(cachedOPR).length && !Object.keys(cachedSeasonOPR).length) {
           loadSeasonOPR().catch(() => {}); // fire-and-forget; predictions re-render lazily
@@ -656,14 +983,29 @@ async function loadEventTabContent() {
         if (!Object.keys(cachedEventSkills).length) {
           try { buildSkillsCache(await fetchAllPages(`/events/${eid}/skills`)); } catch (_) {}
         }
-        html = renderPredWeightsPanel() + '<div id="matches-table-container">' + renderMatches(cachedEventMatches) + '</div>';
+        html = renderPredWeightsPanel() +
+               '<div id="matches-table-container">' + renderMatches(cachedEventMatches) + '</div>' +
+               renderPredictionAccuracy(cachedEventMatches);
+        break;
+      }
+      case 'bracket': {
+        if (!did) { html = '<p class="empty">No divisions found.</p>'; break; }
+        if (!cachedEventMatches.length) {
+          cachedEventMatches = await fetchAllPages(`/events/${eid}/divisions/${did}/matches`);
+          cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
+        }
+        if (!Object.keys(cachedEventRankings).length) {
+          try { buildRankingsCache(await fetchAllPages(`/events/${eid}/divisions/${did}/rankings`)); } catch (_) {}
+        }
+        const rawAlliances = await fetchAllPages(`/events/${eid}/divisions/${did}/alliances`).catch(() => []);
+        html = renderBracketTab(rawAlliances, cachedEventMatches);
         break;
       }
       case 'simulate': {
         if (!did) { html = '<p class="empty">No divisions found.</p>'; break; }
         if (!cachedEventMatches.length) {
           cachedEventMatches = await fetchAllPages(`/events/${eid}/divisions/${did}/matches`);
-          cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2));
+          cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
         }
         if (!Object.keys(cachedEventRankings).length) {
           try { buildRankingsCache(await fetchAllPages(`/events/${eid}/divisions/${did}/rankings`)); } catch (_) {}
@@ -673,6 +1015,40 @@ async function loadEventTabContent() {
         }
         html = renderSimTab();
         break;
+      }
+      case 'picklist': {
+        if (!did) { html = '<p class="empty">No divisions found.</p>'; break; }
+        if (!cachedEventMatches.length) {
+          cachedEventMatches = await fetchAllPages(`/events/${eid}/divisions/${did}/matches`);
+          cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
+        }
+        if (!Object.keys(cachedEventRankings).length) {
+          try { buildRankingsCache(await fetchAllPages(`/events/${eid}/divisions/${did}/rankings`)); } catch (_) {}
+        }
+        if (!Object.keys(cachedEventSkills).length) {
+          try { buildSkillsCache(await fetchAllPages(`/events/${eid}/skills`)); } catch (_) {}
+        }
+        clearStatus('event-tab');
+        el.innerHTML = renderPickList(eid);
+        wirePickList(el, eid);
+        return;
+      }
+      case 'draft': {
+        if (!did) { html = '<p class="empty">No divisions found.</p>'; break; }
+        if (!cachedEventMatches.length) {
+          cachedEventMatches = await fetchAllPages(`/events/${eid}/divisions/${did}/matches`);
+          cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
+        }
+        if (!Object.keys(cachedEventRankings).length) {
+          try { buildRankingsCache(await fetchAllPages(`/events/${eid}/divisions/${did}/rankings`)); } catch (_) {}
+        }
+        if (!Object.keys(cachedEventSkills).length) {
+          try { buildSkillsCache(await fetchAllPages(`/events/${eid}/skills`)); } catch (_) {}
+        }
+        clearStatus('event-tab');
+        el.innerHTML = renderDraftSetup();
+        wireDraftSetup(el);
+        return;
       }
       case 'awards': {
         // Awards predictions need rankings + skills data — fetch if not already loaded
@@ -691,17 +1067,7 @@ async function loadEventTabContent() {
         clearStatus('event-tab');
         el.innerHTML = renderEventAwards(awardsData);
         attachMatchTabListeners(el);
-        // Kick off prior-award history fetch in background; re-renders Excellence card when done
-        if (cachedPriorAwardScores === null) {
-          cachedPriorAwardScores = {}; // mark as in-progress to prevent re-entry
-          loadPriorAwardData().then(scores => {
-            cachedPriorAwardScores = scores;
-            if (activeEventTab === 'awards') {
-              el.innerHTML = renderEventAwards(cachedAwardsData);
-              attachMatchTabListeners(el);
-            }
-          }).catch(() => { cachedPriorAwardScores = {}; });
-        }
+        // Prior award history disabled (caused API timeouts)
         return; // skip the standard el.innerHTML = html below
       }
       case 'skills': {
@@ -760,7 +1126,7 @@ function renderEventRankings(rankings) {
     ].filter(Boolean).join(' · ');
     return `<tr data-num="${esc(r.team?.name)}">
       <td><span class="rank-badge ${cls}">#${r.rank}</span></td>
-      <td><button class="team-link" data-num="${esc(r.team?.name)}">${esc(r.team?.name)}</button></td>
+      <td><button class="team-link" data-num="${esc(r.team?.name)}">${esc(r.team?.name)}</button>${hasScoutNote(r.team?.name) ? '<span class="scout-dot" title="Has scouting notes">●</span>' : ''}</td>
       <td>${r.wins ?? '—'}–${r.losses ?? '—'}–${r.ties ?? '—'}</td>
       <td style="color:var(--text-muted);font-size:.8rem">${pts || '—'}</td>
       <td>${r.max_score ?? '—'}</td>
@@ -845,6 +1211,110 @@ async function loadSeasonOPR() {
   cachedSeasonOPR = seasonOPR;
 }
 
+// ── Multi-stat prediction model ────────────────────────────────────────────
+
+// Per-team score history from completed qual matches (for consistency + form).
+function teamAllianceScores(name) {
+  return cachedEventMatches
+    .filter(m => m.round === 2 && matchIsScored(m))
+    .sort((a, b) => a.matchnum - b.matchnum)
+    .flatMap(m => {
+      const a = (m.alliances || []).find(al => (al.teams || []).some(t => t.team?.name === name));
+      return a?.score != null ? [a.score] : [];
+    });
+}
+
+// Build a normalized [0,1] stat block for every team in the current event.
+// Each dimension is min-max scaled within the field so weights are comparable.
+function buildTeamStatCache() {
+  const teamSet = new Set([
+    ...Object.keys(cachedOPR),
+    ...Object.keys(cachedSeasonOPR),
+    ...Object.keys(cachedEventRankings),
+  ]);
+  if (!teamSet.size) return {};
+
+  const raw = {};
+  for (const name of teamSet) {
+    const o   = cachedOPR[name] || {};
+    const sn  = cachedSeasonOPR[name];
+    const snO = sn != null ? (typeof sn === 'object' ? sn.opr : sn) : null;
+    const snC = sn != null && typeof sn === 'object' ? sn.ccwm : null;
+
+    const opr  = (o.opr >= 2 ? o.opr : null) ?? snO ?? 0;
+    const ccwm = (o.opr >= 2 ? o.ccwm : null) ?? snC ?? 0;
+    const dpr  = (o.opr >= 2 ? o.dpr  : null) ?? (opr - ccwm);
+
+    const wr      = cachedEventRankings[name]?.winRate ?? 0.5;
+    const skills  = cachedEventSkills[name]?.combined ?? 0;
+
+    const scores  = teamAllianceScores(name);
+    const mean    = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : opr;
+    const form    = scores.length
+      ? (() => {
+          const last = scores.slice(-5);
+          const ws = last.reduce((s, v, i) => s + v * (i + 1), 0);
+          const wt = last.reduce((s, _, i) => s + (i + 1), 0);
+          return ws / wt;
+        })()
+      : mean;
+    const consist = scores.length >= 2
+      ? (() => {
+          const variance = scores.reduce((a, s) => a + (s - mean) ** 2, 0) / scores.length;
+          const cv = mean > 0 ? Math.sqrt(variance) / mean : 1;
+          return Math.max(0, 1 - cv); // higher = more consistent
+        })()
+      : 0.5;
+
+    raw[name] = { opr, ccwm, dpr, wr, skills, form, consist };
+  }
+
+  // Min-max normalize each stat across all teams in this event
+  const teams  = Object.keys(raw);
+  const minMax = {};
+  for (const key of ['opr', 'ccwm', 'dpr', 'skills', 'form']) {
+    const vals = teams.map(n => raw[n][key]).filter(isFinite);
+    minMax[key] = { min: Math.min(...vals), max: Math.max(...vals) };
+  }
+
+  const norm = {};
+  for (const name of teams) {
+    const r = raw[name];
+    const n01 = (key, invert = false) => {
+      const { min, max } = minMax[key];
+      const v = max > min ? (r[key] - min) / (max - min) : 0.5;
+      return invert ? 1 - v : v;
+    };
+    norm[name] = {
+      opr_n:    n01('opr'),
+      ccwm_n:   n01('ccwm'),
+      dpr_n:    n01('dpr', true), // lower DPR = better defence
+      wr:       Math.max(0, Math.min(1, r.wr)),
+      skills_n: n01('skills'),
+      form_n:   n01('form'),
+      consist_n: Math.max(0, Math.min(1, r.consist)),
+    };
+  }
+  return norm;
+}
+
+// Multi-stat strength score for a single team (higher = stronger).
+// Uses the 7 tunable weights in predTuning.
+function teamStrength(name, cache) {
+  const s = cache[name];
+  if (!s) return 0; // unknown team
+  const t = predTuning;
+  return t.wOPR * s.opr_n + t.wCCWM * s.ccwm_n + t.wDPR * s.dpr_n
+       + t.wWR  * s.wr    + t.wSkills * s.skills_n
+       + t.wConsist * s.consist_n + t.wForm * s.form_n;
+}
+
+// Lazy cache — rebuilt automatically when event data changes (_predStatCache = null)
+function getPredStatCache() {
+  if (!_predStatCache) _predStatCache = buildTeamStatCache();
+  return _predStatCache;
+}
+
 // ── Effective OPR: current event → season fallback → rankings/skills proxy ─
 function effectiveOPR(name) {
   const entry = cachedOPR[name];
@@ -884,14 +1354,15 @@ function effectiveOPR(name) {
 // CCWM > 0 means the team contributes more than they allow through — genuinely better.
 // When only OPR is available (no event data yet), falls back to OPR directly.
 function effectiveStrength(name) {
+  const cw = predTuning.ccwmW;
   const entry = cachedOPR[name];
   if (entry?.opr >= 2) {
-    return Math.max(1, entry.opr * 0.55 + (entry.opr + entry.ccwm) * 0.45);
+    return Math.max(1, entry.opr + cw * entry.ccwm);
   }
   const s = cachedSeasonOPR[name];
   if (s != null) {
     if (typeof s === 'object' && s.ccwm != null) {
-      return Math.max(1, s.opr * 0.55 + (s.opr + s.ccwm) * 0.45);
+      return Math.max(1, s.opr + cw * s.ccwm);
     }
     const val = typeof s === 'object' ? s.opr : s;
     if (val > 0) return val;
@@ -948,9 +1419,7 @@ function predictMatch(m) {
   const total   = strRed + strBlue;
   const diff    = Math.abs(strRed - strBlue);
 
-  // Logistic confidence: smooth S-curve, asymptotes at ~87%.
-  // tanh(x) ≈ 1 at x≈2, so diff/(total*0.22) = 2 when diff = 44% of total → 87% conf.
-  const confidence = Math.min(87, Math.round(50 + 37 * Math.tanh(diff / (total * 0.22))));
+  const confidence = Math.min(87, Math.round(50 + 37 * Math.tanh(diff / (total * predTuning.tanhScale))));
 
   return {
     redScore:  Math.max(0, Math.round(oprRed)),
@@ -970,14 +1439,17 @@ function renderPredWeightsPanel() {
     '<input type="range" class="weight-slider" min="0" max="100" value="' + w[key] + '" data-key="' + key + '" />' +
     '<span class="weight-val" data-key="' + key + '">' + w[key] + '</span>' +
     '</div>';
+  const tuned = predTuning.ccwmW !== 0.45 || predTuning.tanhScale !== 0.22;
   return '<div class="pred-controls-bar">' +
     '<button id="pred-show-toggle" class="pred-toggle-btn' + (on ? ' active' : '') + '">Show Predictions</button>' +
     '<button class="pred-weights-toggle" id="pred-weights-toggle">⚙ Weights <span class="pred-chevron">▼</span></button>' +
+    '<button class="pred-toggle-btn pred-autotune-btn' + (tuned ? ' active' : '') + '" id="pred-autotune-btn" title="Grid-search CCWM blend &amp; curve steepness to maximise winner accuracy on played matches">🧪 Auto-Tune' + (tuned ? ' ✓' : '') + '</button>' +
     '</div>' +
     '<div class="pred-weights-body hidden" id="pred-weights-body">' +
     row('Current Event (OPR)', 'opr') +
     row('Win Rate (Rankings)',  'ranking') +
     row('Skills Scores',        'skills') +
+    '<div id="autotune-result"></div>' +
     '</div>';
 }
 
@@ -2223,7 +2695,16 @@ const COUNTRY_COORDS = {
 
 const PROGRAM_IDS = { all: null, v5rc: 1, vexu: 4, viqrc: 41 };
 
-let mapState = { programId: 1, grade: 'all', eventId: null, countryData: {}, leafletMap: null, markerLayer: null, heatLayer: null, heatmap: false, skillsHeatmap: false, skillsHeatLayer: null, sourceView: 'view-search' };
+let mapState = {
+  programId: 1, grade: 'all', eventId: null, countryData: {}, sourceView: 'view-search',
+  leafletMap: null, markerLayer: null,
+  heatLayer: null, heatmap: false,
+  skillsHeatLayer: null, skillsHeatmap: false,
+  eventsLayer: null, showEvents: false,
+  stateLayer: null, showStateSkills: false,
+  travelLayer: null,
+  allTeams: null, dots: {},
+};
 let _mapLoadGen = 0;
 const _seasonIdCache      = {};   // programId -> seasonId (in-memory, avoids repeated API calls)
 const _seasonListCache    = {};   // programId -> [{ id, name }] fetched season list
@@ -2237,6 +2718,9 @@ function destroyLeafletMap() {
     mapState.markerLayer = null;
     mapState.heatLayer = null;
     mapState.skillsHeatLayer = null;
+    mapState.eventsLayer = null;
+    mapState.stateLayer = null;
+    mapState.travelLayer = null;
   }
 }
 
@@ -2501,27 +2985,59 @@ async function loadSkillsHeatmap() {
   }
 }
 
+// Haversine distance in km between two lat/lon pairs
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Interpolate N points along the great-circle arc between two lat/lon pairs.
+// Returns an array of [lat, lon] suitable for L.polyline — the arc will follow
+// the actual shortest path on the sphere rather than a straight Mercator line.
+function geodesicPoints(lat1, lon1, lat2, lon2, n = 64) {
+  const toRad = d => d * Math.PI / 180;
+  const toDeg = r => r * 180 / Math.PI;
+  const φ1 = toRad(lat1), λ1 = toRad(lon1);
+  const φ2 = toRad(lat2), λ2 = toRad(lon2);
+  // Convert to unit Cartesian vectors
+  const x1 = Math.cos(φ1)*Math.cos(λ1), y1 = Math.cos(φ1)*Math.sin(λ1), z1 = Math.sin(φ1);
+  const x2 = Math.cos(φ2)*Math.cos(λ2), y2 = Math.cos(φ2)*Math.sin(λ2), z2 = Math.sin(φ2);
+  const dot = Math.min(1, Math.max(-1, x1*x2 + y1*y2 + z1*z2));
+  const angle = Math.acos(dot);
+  if (angle < 1e-6) return [[lat1, lon1], [lat2, lon2]];
+  const sinA = Math.sin(angle);
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const a = Math.sin((1 - t) * angle) / sinA;
+    const b = Math.sin(t * angle) / sinA;
+    const x = a*x1 + b*x2, y = a*y1 + b*y2, z = a*z1 + b*z2;
+    pts.push([toDeg(Math.atan2(z, Math.sqrt(x*x + y*y))), toDeg(Math.atan2(y, x))]);
+  }
+  return pts;
+}
+
 async function openMapView(eventId) {
   mapState.eventId    = eventId || null;
   mapState.sourceView = eventId ? 'view-event' : 'view-search';
-  // Always show all grades for event-specific maps so no teams are accidentally hidden
   if (eventId) mapState.grade = 'all';
   showView('view-map');
-
-  // Default to V5RC on global view so we don't try to load every team on earth
   if (!eventId) mapState.programId = mapState.programId || 1;
 
-
   const filterEl = document.getElementById('map-filters');
+  const isEvent  = !!eventId;
+
   filterEl.innerHTML =
     '<div class="map-filters">' +
-    (eventId
-      ? '<span class="sim-label">Showing teams at: <strong>' + esc(currentEvent?.name || 'Event') + '</strong></span>'
+    (isEvent
+      ? '<span class="sim-label">Teams at: <strong>' + esc(currentEvent?.name || 'Event') + '</strong></span>'
       : '<select class="map-filter-select" id="map-prog-select">' +
-        '<option value="all"' + (mapState.programId === null ? ' selected' : '') + '>All Programs</option>' +
-        '<option value="v5rc"'  + (mapState.programId === 1  ? ' selected' : '') + '>V5RC</option>' +
-        '<option value="vexu"'  + (mapState.programId === 4  ? ' selected' : '') + '>VEXU</option>'  +
-        '<option value="viqrc"' + (mapState.programId === 41 ? ' selected' : '') + '>VIQRC</option>' +
+        '<option value="all"'   + (mapState.programId === null ? ' selected' : '') + '>All Programs</option>' +
+        '<option value="v5rc"'  + (mapState.programId === 1    ? ' selected' : '') + '>V5RC</option>' +
+        '<option value="vexu"'  + (mapState.programId === 4    ? ' selected' : '') + '>VEXU</option>'  +
+        '<option value="viqrc"' + (mapState.programId === 41   ? ' selected' : '') + '>VIQRC</option>' +
         '</select>' +
         '<select class="map-filter-select" id="map-grade-select">' +
         '<option value="all"'          + (mapState.grade === 'all'           ? ' selected' : '') + '>All Grades</option>' +
@@ -2529,14 +3045,16 @@ async function openMapView(eventId) {
         '<option value="High School"'  + (mapState.grade === 'High School'   ? ' selected' : '') + '>High School</option>' +
         '<option value="College"'      + (mapState.grade === 'College'       ? ' selected' : '') + '>College</option>' +
         '</select>') +
-    '<button class="map-toggle-btn' + (mapState.heatmap ? ' active' : '') + '" id="map-heat-toggle" title="Team density heatmap">Density Heat Map</button>' +
-    '<button class="map-toggle-btn' + (mapState.skillsHeatmap ? ' active' : '') + '" id="map-skills-heat-toggle" title="Skills quality heatmap — brighter = higher combined skills scores">Skills Heat Map</button>' +
+    '<button class="map-toggle-btn' + (mapState.heatmap         ? ' active' : '') + '" id="map-heat-toggle">Density</button>' +
+    '<button class="map-toggle-btn' + (mapState.skillsHeatmap   ? ' active' : '') + '" id="map-skills-heat-toggle">Skills Heat</button>' +
+    (!isEvent ? '<button class="map-toggle-btn' + (mapState.showEvents      ? ' active' : '') + '" id="map-events-toggle">Events</button>' : '') +
+    (!isEvent ? '<button class="map-toggle-btn' + (mapState.showStateSkills ? ' active' : '') + '" id="map-state-toggle">State Skills</button>' : '') +
+    (isEvent  ? '<button class="map-toggle-btn' + (mapState.travelLayer     ? ' active' : '') + '" id="map-travel-toggle">Travel Lines</button>' : '') +
     '</div>';
 
-  if (!eventId) {
+  if (!isEvent) {
     document.getElementById('map-prog-select').addEventListener('change', e => {
       mapState.programId = PROGRAM_IDS[e.target.value] ?? null;
-      // Reset grade to all when switching programs to avoid empty maps
       mapState.grade = 'all';
       document.getElementById('map-grade-select').value = 'all';
       loadMapData();
@@ -2548,34 +3066,251 @@ async function openMapView(eventId) {
   }
 
   document.getElementById('map-heat-toggle').addEventListener('click', async function () {
-    if (!mapState.heatmap) {
-      const ok = await ensureLeafletHeat();
-      if (!ok) return;
-    }
+    if (!mapState.heatmap) { const ok = await ensureLeafletHeat(); if (!ok) return; }
     mapState.heatmap = !mapState.heatmap;
     this.classList.toggle('active', mapState.heatmap);
     if (mapState.allTeams) updateMapOverlay(mapState.allTeams);
   });
 
   document.getElementById('map-skills-heat-toggle').addEventListener('click', async function () {
-    const ok = await ensureLeafletHeat();
-    if (!ok) return;
+    const ok = await ensureLeafletHeat(); if (!ok) return;
     mapState.skillsHeatmap = !mapState.skillsHeatmap;
     this.classList.toggle('active', mapState.skillsHeatmap);
     if (mapState.skillsHeatmap) {
       loadSkillsHeatmap();
-      if (mapState.allTeams) updateMapOverlay(mapState.allTeams); // hide dots immediately
+      if (mapState.allTeams) updateMapOverlay(mapState.allTeams);
     } else {
       if (mapState.skillsHeatLayer) { mapState.skillsHeatLayer.remove(); mapState.skillsHeatLayer = null; }
-      if (mapState.allTeams) updateMapOverlay(mapState.allTeams); // restore dots if no other heatmap
+      if (mapState.allTeams) updateMapOverlay(mapState.allTeams);
     }
   });
 
-  const panel = document.getElementById('map-country-panel');
-  panel.classList.add('hidden');
-  panel.innerHTML = '';
+  document.getElementById('map-events-toggle')?.addEventListener('click', async function () {
+    mapState.showEvents = !mapState.showEvents;
+    this.classList.toggle('active', mapState.showEvents);
+    if (mapState.showEvents) loadEventsLayer();
+    else if (mapState.eventsLayer) { mapState.eventsLayer.remove(); mapState.eventsLayer = null; }
+  });
+
+  document.getElementById('map-state-toggle')?.addEventListener('click', async function () {
+    mapState.showStateSkills = !mapState.showStateSkills;
+    this.classList.toggle('active', mapState.showStateSkills);
+    if (mapState.showStateSkills) loadStateSkillsLayer();
+    else if (mapState.stateLayer) { mapState.stateLayer.remove(); mapState.stateLayer = null; }
+  });
+
+  document.getElementById('map-travel-toggle')?.addEventListener('click', function () {
+    if (mapState.travelLayer) {
+      mapState.travelLayer.remove(); mapState.travelLayer = null;
+      this.classList.remove('active');
+    } else {
+      this.classList.add('active');
+      drawTravelLines();
+    }
+  });
+
+  document.getElementById('map-country-panel').classList.add('hidden');
+  document.getElementById('map-country-panel').innerHTML = '';
 
   await loadMapData();
+}
+
+// ── Events layer: pins for every event this season ─────────────────────────
+async function loadEventsLayer() {
+  if (!mapState.leafletMap) return;
+  const pid = mapState.programId || 1;
+  const sid = await getActiveSeasonId(pid);
+  if (!sid) return;
+
+  const btn = document.getElementById('map-events-toggle');
+  if (btn) btn.textContent = 'Events…';
+
+  let events = [];
+  try {
+    events = await fetchAllPages(`/events?season[]=${sid}&program[]=${pid}&per_page=250`);
+  } catch (_) {}
+
+  if (btn) btn.textContent = 'Events';
+  if (!mapState.showEvents || !mapState.leafletMap) return;
+
+  if (mapState.eventsLayer) mapState.eventsLayer.remove();
+  mapState.eventsLayer = L.layerGroup().addTo(mapState.leafletMap);
+
+  const now = Date.now();
+  for (const ev of events) {
+    const lat = ev.location?.coordinates?.lat;
+    const lon = ev.location?.coordinates?.lon;
+    if (lat == null || lon == null) continue;
+
+    const start = ev.start ? new Date(ev.start) : null;
+    const end   = ev.end   ? new Date(ev.end)   : null;
+    const isOngoing = start && end && start.getTime() <= now && end.getTime() >= now;
+    const isFuture  = start && start.getTime() > now;
+
+    const color = isOngoing ? '#22C55E' : isFuture ? '#3B82F6' : '#9CA3AF';
+    const radius = isOngoing ? 8 : isFuture ? 6 : 4;
+
+    const marker = L.circleMarker([lat, lon], {
+      radius, fillColor: color, color: '#fff',
+      weight: 1.5, opacity: 1, fillOpacity: isOngoing ? 1 : 0.75,
+    }).addTo(mapState.eventsLayer);
+
+    const dateStr = start ? start.toLocaleDateString() : '—';
+    const statusStr = isOngoing ? '🟢 Ongoing' : isFuture ? '🔵 Upcoming' : '⚫ Past';
+    marker.bindTooltip(
+      `<strong>${esc(ev.name)}</strong><br>${statusStr} · ${dateStr}<br>${[ev.location?.city, ev.location?.region].filter(Boolean).join(', ')}`,
+      { direction: 'top', offset: [0, -4] }
+    );
+    marker.on('click', () => openEventDetail(ev));
+  }
+
+  const legendEl = document.getElementById('map-legend');
+  if (legendEl) legendEl.innerHTML +=
+    '<div class="map-legend" style="margin-top:4px">' +
+    '<span style="color:#22C55E;font-weight:700">● Ongoing</span> &nbsp;' +
+    '<span style="color:#3B82F6;font-weight:700">● Upcoming</span> &nbsp;' +
+    '<span style="color:#9CA3AF">● Past</span> &nbsp;' +
+    '<span style="margin-left:auto;color:var(--text-muted);font-size:.75rem">' + events.length + ' events</span>' +
+    '</div>';
+}
+
+// ── US state skills choropleth ─────────────────────────────────────────────
+async function loadStateSkillsLayer() {
+  if (!mapState.leafletMap) return;
+  const pid = mapState.programId || 1;
+  const sid = await getActiveSeasonId(pid);
+  if (!sid) return;
+
+  const btn = document.getElementById('map-state-toggle');
+  if (btn) btn.textContent = 'Loading…';
+
+  let geojson, allSkills;
+  try {
+    [geojson, allSkills] = await Promise.all([
+      fetch('https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json').then(r => r.json()),
+      fetchSkillsStandings(pid, sid, null),
+    ]);
+  } catch (_) {
+    if (btn) btn.textContent = 'State Skills';
+    return;
+  }
+  if (btn) btn.textContent = 'State Skills';
+  if (!mapState.showStateSkills || !mapState.leafletMap) return;
+
+  // Group by state → compute avg of top 10 combined scores
+  const byState = {};
+  for (const t of allSkills) {
+    if (t.country !== 'United States' && t.country !== 'USA') continue;
+    const region = (t.region || '').trim();
+    let state = region;
+    if (!US_STATE_COORDS[state]) {
+      state = Object.keys(US_STATE_COORDS).find(s => region.startsWith(s)) || null;
+    }
+    if (!state) continue;
+    (byState[state] = byState[state] || []).push(t.combined || 0);
+  }
+
+  const stateAvg = {};
+  let maxAvg = 0;
+  for (const [state, scores] of Object.entries(byState)) {
+    scores.sort((a, b) => b - a);
+    const top = scores.slice(0, Math.max(1, Math.ceil(scores.length * 0.1)));
+    stateAvg[state] = top.reduce((a, b) => a + b, 0) / top.length;
+    if (stateAvg[state] > maxAvg) maxAvg = stateAvg[state];
+  }
+
+  if (mapState.stateLayer) mapState.stateLayer.remove();
+  mapState.stateLayer = L.geoJSON(geojson, {
+    style: feature => {
+      const name  = feature.properties?.name || '';
+      const score = stateAvg[name] || 0;
+      const frac  = maxAvg > 0 ? score / maxAvg : 0;
+      // Gradient: light gray (no data/low) → deep blue → orange (elite)
+      const hue   = frac > 0 ? Math.round(220 - frac * 160) : 0;
+      const sat   = frac > 0 ? 70 : 0;
+      const lit   = frac > 0 ? Math.round(65 - frac * 30) : 88;
+      return { fillColor: `hsl(${hue},${sat}%,${lit}%)`, weight: 0.8, color: '#fff', fillOpacity: frac > 0 ? 0.8 : 0.25 };
+    },
+    onEachFeature: (feature, layer) => {
+      const name  = feature.properties?.name || '?';
+      const score = stateAvg[name];
+      const count = byState[name]?.length || 0;
+      layer.bindTooltip(
+        `<strong>${esc(name)}</strong><br>` +
+        (score ? `Avg top-10% skills: ${score.toFixed(0)}<br>${count} teams` : 'No data'),
+        { sticky: true }
+      );
+    },
+  }).addTo(mapState.leafletMap);
+
+  mapState.leafletMap.fitBounds(mapState.stateLayer.getBounds(), { padding: [20, 20] });
+  const legendEl = document.getElementById('map-legend');
+  if (legendEl) legendEl.innerHTML +=
+    '<div class="map-legend" style="margin-top:4px">' +
+    '<span>Low</span><div class="map-legend-bar" style="background:linear-gradient(to right,#e5e7eb,#2563eb,#ea580c)"></div><span>Elite</span>' +
+    '<span style="margin-left:auto;color:var(--text-muted);font-size:.75rem">Top-10% avg skills by US state</span></div>';
+}
+
+// ── Travel distance lines (event map mode) ─────────────────────────────────
+function drawTravelLines() {
+  if (!mapState.leafletMap || !mapState.eventId || !mapState.allTeams?.length) return;
+
+  const venueLat = currentEvent?.location?.coordinates?.lat;
+  const venueLon = currentEvent?.location?.coordinates?.lon;
+  if (venueLat == null || venueLon == null) return;
+
+  if (mapState.travelLayer) mapState.travelLayer.remove();
+  mapState.travelLayer = L.layerGroup().addTo(mapState.leafletMap);
+
+  // Venue marker
+  L.circleMarker([venueLat, venueLon], {
+    radius: 10, fillColor: '#F59E0B', color: '#fff', weight: 2, fillOpacity: 1,
+  }).bindTooltip(`<strong>Venue</strong><br>${esc(currentEvent?.name || '')}`, { permanent: false })
+    .addTo(mapState.travelLayer);
+
+  const distances = [];
+  for (const t of mapState.allTeams) {
+    let lat = t.location?.coordinates?.lat;
+    let lon = t.location?.coordinates?.lon;
+    if (lat == null || lon == null) {
+      const country = t.location?.country;
+      if (country && COUNTRY_COORDS[country]) { [lat, lon] = COUNTRY_COORDS[country]; }
+      else continue;
+    }
+    const km = haversineKm(venueLat, venueLon, lat, lon);
+    distances.push({ t, lat, lon, km });
+  }
+
+  if (!distances.length) return;
+  const maxKm = Math.max(...distances.map(d => d.km));
+
+  for (const { t, lat, lon, km } of distances) {
+    const frac  = maxKm > 0 ? km / maxKm : 0;
+    const hue   = Math.round(120 - frac * 120); // green(120) → red(0)
+    const color = `hsl(${hue},80%,45%)`;
+    const mi    = (km * 0.621371).toFixed(0);
+
+    // Use geodesic arc so the line follows the actual great-circle path on the globe
+    // rather than a straight line in Mercator projection (critical for intercontinental routes)
+    L.polyline(geodesicPoints(venueLat, venueLon, lat, lon), {
+      color, weight: 1.2, opacity: 0.55,
+    }).bindTooltip(
+      `<strong>${esc(t.number || t.name)}</strong><br>${km.toFixed(0)} km / ${mi} mi`,
+      { sticky: true }
+    ).addTo(mapState.travelLayer);
+  }
+
+  distances.sort((a, b) => b.km - a.km);
+  const top5 = distances.slice(0, 5).map(d =>
+    `<tr><td>${esc(d.t.number||d.t.name)}</td><td>${d.km.toFixed(0)} km</td></tr>`
+  ).join('');
+  const legendEl = document.getElementById('map-legend');
+  if (legendEl) legendEl.innerHTML +=
+    `<div class="map-legend" style="margin-top:8px;flex-direction:column;align-items:flex-start;gap:4px">` +
+    `<span style="font-size:.75rem;font-weight:700">Farthest travelers</span>` +
+    `<table style="font-size:.75rem;border-collapse:collapse">${top5}</table>` +
+    `<span style="font-size:.7rem;color:var(--text-muted)">green = local · red = far · ${distances.length} teams</span>` +
+    `</div>`;
 }
 
 async function fetchProgramSeasons(programId) {
@@ -2957,6 +3692,324 @@ function gaussianElim(A, b, n) {
   );
 }
 
+// ── Bracket & Alliance Selection ──────────────────────────────────────────────
+
+// ── Elimination bracket simulator ─────────────────────────────────────────
+// Compute a composite strength score for an alliance (array of team name strings).
+// Combines OPR, CCWM, win rate, skills, and consistency into one number.
+function allianceStrength(teams) {
+  const opr   = teams.reduce((s, n) => s + (cachedOPR[n]?.opr  ?? cachedSeasonOPR[n]?.opr  ?? 0), 0);
+  const ccwm  = teams.reduce((s, n) => s + (cachedOPR[n]?.ccwm ?? cachedSeasonOPR[n]?.ccwm ?? 0), 0);
+  const wr    = teams.reduce((s, n) => s + (cachedEventRankings[n]?.winRate ?? 0.5), 0) / teams.length;
+  const skill = teams.reduce((s, n) => s + (cachedEventSkills[n]?.combined ?? 0), 0);
+  // Normalize skills to a comparable scale (~200 combined = roughly 2 pts contribution)
+  return opr * 0.40 + ccwm * 0.25 + wr * 20 * 0.20 + (skill / 100) * 0.15;
+}
+
+// Simulate a single elimination match; returns 'A' or 'B'.
+function simElimGame(teamsA, teamsB) {
+  const sA = allianceStrength(teamsA);
+  const sB = allianceStrength(teamsB);
+  const tot = sA + sB;
+  const probA = tot > 0 ? 0.5 + 0.45 * Math.tanh((sA - sB) / (tot * 0.35)) : 0.5;
+  return Math.random() < probA ? 'A' : 'B';
+}
+
+// Best-of-3 series
+function simBo3(teamsA, teamsB) {
+  let wA = 0, wB = 0;
+  while (wA < 2 && wB < 2) {
+    simElimGame(teamsA, teamsB) === 'A' ? wA++ : wB++;
+  }
+  return { winner: wA > wB ? 'A' : 'B', wA, wB };
+}
+
+// Single-elimination bracket for N alliances.
+// Pads to next power of 2 — top seeds get first-round byes.
+// alliances: [{ label, teams: [name, ...] }]
+// Returns rounds: [[{ aLabel, bLabel, aTeams, bTeams, wA, wB }], ...]
+function runElimBracket(alliances) {
+  const n = alliances.length;
+  if (n < 2) return [];
+
+  // Next power of 2 for bracket size
+  let size = 2;
+  while (size < n) size *= 2;
+
+  // field[i] = alliance or null (BYE). Top seeds come first.
+  let field = Array.from({ length: size }, (_, i) => (i < n ? alliances[i] : null));
+
+  const rounds = [];
+
+  while (field.length > 1) {
+    const roundMatches = [];
+    const nextField = [];
+    const half = field.length / 2;
+
+    // Pair seed i vs seed (size-1-i): top bracket vs bottom bracket
+    for (let i = 0; i < half; i++) {
+      const a = field[i];
+      const b = field[field.length - 1 - i];
+
+      if (!a && !b) continue;
+      if (!a) { nextField.push(b); continue; } // b gets bye
+      if (!b) { nextField.push(a); continue; } // a gets bye
+
+      const { winner, wA, wB } = simBo3(a.teams, b.teams);
+      roundMatches.push({ aLabel: a.label, bLabel: b.label, aTeams: a.teams, bTeams: b.teams, wA, wB });
+      nextField.push(winner === 'A' ? a : b);
+    }
+
+    if (roundMatches.length > 0) rounds.push(roundMatches);
+    field = nextField;
+  }
+
+  return rounds;
+}
+
+function renderSimBracket(alliances, yourLabel) {
+  // alliances: [{ label, teams }]
+  const rounds = runElimBracket(alliances);
+  const total = rounds.length;
+  const roundName = (ri) => {
+    const fromEnd = total - 1 - ri;
+    if (fromEnd === 0) return 'Finals';
+    if (fromEnd === 1) return 'Semifinals';
+    if (fromEnd === 2) return 'Quarterfinals';
+    return `Round ${ri + 1}`;
+  };
+
+  const roundsHTML = rounds.map((matches, ri) => {
+    const name = roundName(ri);
+    const matchCards = matches.map(m => {
+      const aWon = m.wA > m.wB, bWon = m.wB > m.wA;
+      const aYours = m.aLabel === yourLabel, bYours = m.bLabel === yourLabel;
+      return `<div class="sb-match">
+        <div class="sb-row ${aWon ? 'sb-won' : 'sb-lost'} ${aYours ? 'sb-yours' : ''}">
+          <span class="sb-label">${esc(m.aLabel)}</span>
+          <span class="sb-teams">${m.aTeams.map(t => esc(t)).join(' / ')}</span>
+          <span class="sb-score">${m.wA}</span>
+        </div>
+        <div class="sb-row ${bWon ? 'sb-won' : 'sb-lost'} ${bYours ? 'sb-yours' : ''}">
+          <span class="sb-label">${esc(m.bLabel)}</span>
+          <span class="sb-teams">${m.bTeams.map(t => esc(t)).join(' / ')}</span>
+          <span class="sb-score">${m.wB}</span>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="sb-round"><div class="sb-round-name">${name}</div>${matchCards}</div>`;
+  }).join('');
+
+  const finalMatch  = rounds[rounds.length - 1]?.[0];
+  const champion    = finalMatch
+    ? (finalMatch.wA > finalMatch.wB ? finalMatch.aLabel : finalMatch.bLabel)
+    : '—';
+  const youWon      = champion === yourLabel;
+
+  return `
+    <div class="stats-section">
+      <div class="section-title">Simulated Elimination Bracket
+        <span class="sim-badge">Simulated</span>
+      </div>
+      <p class="pl-info">Win probability uses OPR (40%) + CCWM (25%) + Win Rate (20%) + Skills (15%). Best-of-3 series.</p>
+      <div class="sb-bracket">${roundsHTML}</div>
+      <div class="sb-champion">${youWon ? '🏆 Your alliance wins the event!' : `Champion: ${esc(champion)}`}</div>
+    </div>`;
+}
+
+function simulateAllianceSelection() {
+  const ranked = Object.entries(cachedEventRankings).sort(([,a],[,b]) => a.rank - b.rank);
+  if (ranked.length < 4) return [];
+  // VEX alliances = 2 teams: captain + 1 partner
+  const n = Math.min(8, Math.floor(ranked.length / 2));
+  const opr = { ...cachedSeasonOPR, ...cachedOPR };
+  const all = ranked.map(([name, r]) => ({ name, rank: r.rank }));
+  const captains = all.slice(0, n);
+  // Available = everyone not a captain (captains can't be picked in simulated bracket projection)
+  const available = all.slice(n);
+  const alliances = captains.map((c, i) => ({ num: i + 1, captain: c, picks: [] }));
+
+  // Single round: each captain picks 1 partner in seeding order, by OPR
+  for (let ai = 0; ai < n; ai++) {
+    if (!available.length) break;
+    available.sort((a, b) => (opr[b.name]?.opr ?? 0) - (opr[a.name]?.opr ?? 0));
+    alliances[ai].picks.push(available.shift());
+  }
+  return alliances;
+}
+
+function renderBracketTab(rawAlliances, matches) {
+  const hasReal = rawAlliances.length > 0;
+  let allianceList = [];
+
+  if (hasReal) {
+    allianceList = rawAlliances.map(a => {
+      const teams = a.teams || [];
+      const captain = teams.find(t => t.captain)?.team || teams[0]?.team;
+      const picks   = teams.filter(t => !t.captain).map(t => t.team);
+      return { num: a.number, captain: { name: captain?.name || '?' }, picks: picks.map(t => ({ name: t?.name || '?' })) };
+    }).sort((a, b) => a.num - b.num);
+  } else {
+    allianceList = simulateAllianceSelection();
+  }
+
+  return renderAllianceSection(allianceList, hasReal) + renderEliminationBracket(matches, allianceList);
+}
+
+function renderAllianceSection(alliances, isReal) {
+  const qualTeams = Object.keys(cachedEventRankings).length;
+  const opr = { ...cachedSeasonOPR, ...cachedOPR };
+
+  if (!alliances.length) return `<div class="stats-section"><div class="section-title">Alliances</div><p class="empty">Not enough ranking data to project alliances.</p></div>`;
+
+  const cards = alliances.map(a => {
+    function teamChip(t, role) {
+      const o = opr[t.name]?.opr;
+      return `<div class="alliance-member">
+        <span class="alliance-role-tag ${role}">${role === 'C' ? 'Captain' : 'Pick ' + (role)}</span>
+        <button class="team-link alliance-team-btn" data-num="${esc(t.name)}">${esc(t.name)}</button>
+        ${o != null ? `<span class="alliance-opr">OPR ${o.toFixed(1)}</span>` : ''}
+      </div>`;
+    }
+    return `<div class="alliance-card">
+      <div class="alliance-num-badge">#${a.num}</div>
+      ${teamChip(a.captain, 'C')}
+      ${a.picks.map((p, i) => teamChip(p, i + 1)).join('')}
+    </div>`;
+  }).join('');
+
+  const diffHtml = qualTeams ? computeEventDifficultyHTML() : '';
+
+  return `<div class="stats-section">
+    <div class="section-title">Alliances ${!isReal ? '<span class="sim-badge">Simulated</span>' : ''}</div>
+    ${!isReal ? `<p class="sim-info">Projected from qual rankings: top ${alliances.length} teams as captains, each picks 1 partner by OPR.</p>` : ''}
+    <div class="alliance-grid">${cards}</div>
+    ${diffHtml}
+  </div>`;
+}
+
+function computeEventDifficultyHTML() {
+  const oprVals = Object.values(cachedOPR).map(o => o.opr).filter(v => v > 0);
+  const skillVals = Object.values(cachedEventSkills).map(s => s.driver + s.prog).filter(v => v > 0);
+  if (!oprVals.length && !skillVals.length) return '';
+
+  const avgOPR   = oprVals.length   ? oprVals.reduce((a,b)=>a+b,0)   / oprVals.length   : null;
+  const avgSkill = skillVals.length ? skillVals.reduce((a,b)=>a+b,0) / skillVals.length : null;
+  const maxSkill = skillVals.length ? Math.max(...skillVals) : null;
+  const numTeams = Object.keys(cachedEventRankings).length;
+
+  // Rough difficulty score 0-100 based on avg OPR (calibrated to ~V5RC norms)
+  const oprScore   = avgOPR   != null ? Math.min(100, Math.round(avgOPR   / 1.2))  : null;
+  const skillScore = avgSkill != null ? Math.min(100, Math.round(avgSkill / 2.5))  : null;
+  const combined   = [oprScore, skillScore].filter(v=>v!=null);
+  const diffScore  = combined.length ? Math.round(combined.reduce((a,b)=>a+b,0)/combined.length) : null;
+
+  const label = diffScore == null ? '—'
+    : diffScore >= 75 ? 'Very Competitive'
+    : diffScore >= 55 ? 'Competitive'
+    : diffScore >= 35 ? 'Moderate'
+    : 'Developing';
+  const color = diffScore == null ? 'var(--text-muted)'
+    : diffScore >= 75 ? '#DC2626'
+    : diffScore >= 55 ? '#D97706'
+    : diffScore >= 35 ? '#2563EB'
+    : 'var(--text-muted)';
+
+  const stat = (lbl, val) => val != null ? `<div class="diff-stat"><span class="diff-stat-label">${lbl}</span><span class="diff-stat-val">${val}</span></div>` : '';
+
+  return `<div class="difficulty-card">
+    <div class="difficulty-label">Event Difficulty</div>
+    <div class="difficulty-score" style="color:${color}">${label}${diffScore != null ? ` <span style="font-size:.75rem;font-weight:400;opacity:.7">(${diffScore}/100)</span>` : ''}</div>
+    <div class="diff-stats-row">
+      ${stat('Teams', numTeams)}
+      ${stat('Avg OPR', avgOPR != null ? avgOPR.toFixed(1) : null)}
+      ${stat('Avg Skills', avgSkill != null ? Math.round(avgSkill) : null)}
+      ${stat('Top Skills', maxSkill)}
+    </div>
+  </div>`;
+}
+
+function renderEliminationBracket(matches, alliances) {
+  const elimMatches = matches.filter(m => m.round >= 3);
+
+  const teamAlliance = {};
+  alliances.forEach(a => {
+    [a.captain, ...a.picks].forEach(t => { if (t?.name) teamAlliance[t.name] = a.num; });
+  });
+
+  const groups = {};
+  elimMatches.forEach(m => {
+    const key = `${m.round}-${m.instance || 1}`;
+    (groups[key] = groups[key] || []).push(m);
+  });
+
+  function matchupCard(games) {
+    const first = games[0];
+    const redA   = first?.alliances?.find(a => a.color === 'red');
+    const blueA  = first?.alliances?.find(a => a.color === 'blue');
+    const redTeams  = (redA?.teams  || []).map(t => t.team?.name).filter(Boolean);
+    const blueTeams = (blueA?.teams || []).map(t => t.team?.name).filter(Boolean);
+
+    let redWins = 0, blueWins = 0;
+    const gamePairs = [];
+    games.forEach(g => {
+      if (!matchIsScored(g)) return;
+      const r = g.alliances?.find(a => a.color === 'red');
+      const b = g.alliances?.find(a => a.color === 'blue');
+      if (!r || !b) return;
+      gamePairs.push([r.score, b.score]);
+      if (r.score > b.score) redWins++; else if (b.score > r.score) blueWins++;
+    });
+    const winner = redWins >= 2 ? 'red' : blueWins >= 2 ? 'blue' : null;
+
+    function alNum(teams) {
+      const n = teams.map(t => teamAlliance[t]).filter(Boolean);
+      return n.length ? [...new Set(n)][0] : null;
+    }
+
+    function teamRow(teams, wins, isRed) {
+      const al  = alNum(teams);
+      const won = winner === (isRed ? 'red' : 'blue');
+      const lost = winner && !won;
+      const chips = teams.map(t =>
+        `<button class="team-link bk-team-btn" data-num="${esc(t)}">${esc(t)}</button>`
+      ).join('');
+      return `<div class="bk-row${won ? ' bk-won' : lost ? ' bk-lost' : ''}">
+        ${al ? `<span class="bk-al-tag">#${al}</span>` : ''}
+        <span class="bk-teams">${chips}</span>
+        ${gamePairs.length ? `<span class="bk-wins">${wins}</span>` : ''}
+      </div>`;
+    }
+
+    const scoreStr = gamePairs.map(([r,b]) => `${r}–${b}`).join(' · ');
+
+    return `<div class="bk-match">
+      ${teamRow(redTeams,  redWins,  true)}
+      ${teamRow(blueTeams, blueWins, false)}
+      ${scoreStr ? `<div class="bk-scores">${scoreStr}</div>` : ''}
+    </div>`;
+  }
+
+  const ROUND_ORDER  = [6, 3, 4, 5];
+  const ROUND_LABELS = { 6: 'R16', 3: 'Quarterfinals', 4: 'Semifinals', 5: 'Finals' };
+
+  const usedRounds = ROUND_ORDER.filter(r => Object.keys(groups).some(k => k.startsWith(`${r}-`)));
+  if (!usedRounds.length) return `<div class="stats-section"><div class="section-title">Elimination Bracket</div><p class="empty">Elimination matches have not started yet.</p></div>`;
+
+  const cols = usedRounds.map(r => {
+    const keys = Object.keys(groups).filter(k => k.startsWith(`${r}-`)).sort();
+    return `<div class="bk-col">
+      <div class="bk-round-label">${ROUND_LABELS[r]}</div>
+      <div class="bk-col-matches">${keys.map(k => matchupCard(groups[k])).join('')}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="stats-section">
+    <div class="section-title">Elimination Bracket</div>
+    <div class="bk-wrap">${cols}</div>
+  </div>`;
+}
+
 // ── Award classification ────────────────────────────────────────────────────
 // criteria values:
 //   'top40'      — top 40% qual rank + top 40% combined skills + programming skills > 0 (Excellence)
@@ -3025,43 +4078,27 @@ function classifyAward(title) {
   return 'other';
 }
 
-// Extract all winners from an award object, handling every format the API returns:
-//   a.teams   = [{ team: { id, name, number }, division: { id, name } }]  — structured
-//   a.winners = ["8838E", "Volunteer Name"]                               — flat strings
+// Extract all winners from an award object.
+// The RobotEvents v2 API returns:
+//   a.teamWinners       = [{ team: { id, name, number }, division: { id, name } }]
+//   a.individualWinners = ["Person Name", ...]
 function extractAwardWinners(a) {
   if (!a) return [];
   const results = [];
   const seen = new Set();
 
-  for (const t of (a.teams || [])) {
-    // Nested format: { team: { name }, division }
+  for (const t of (a.teamWinners || [])) {
     const teamName = t.team?.name || t.team?.number;
     if (teamName && !seen.has(teamName)) {
       seen.add(teamName);
       results.push({ kind: 'team', name: teamName, division: t.division?.name || null });
     }
-    // Direct format: team object IS the winner (no nesting)
-    else if (!t.team && (t.name || t.number) && !seen.has(t.name || t.number)) {
-      const n = t.name || t.number;
-      seen.add(n);
-      results.push({ kind: 'team', name: n, division: null });
-    }
-    // Person winner embedded in team slot
-    if (t.person && !seen.has(t.person)) {
-      seen.add(t.person);
-      results.push({ kind: 'person', name: t.person });
-    }
   }
 
-  for (const w of (a.winners || [])) {
+  for (const w of (a.individualWinners || [])) {
     if (!w || seen.has(w)) continue;
     seen.add(w);
-    // Team number: one or more digits, optionally followed by a single letter (8838E, 1234, 99999X)
-    if (/^\d+[A-Za-z]?$/.test(w.trim())) {
-      results.push({ kind: 'team', name: w.trim(), division: null });
-    } else {
-      results.push({ kind: 'person', name: w });
-    }
+    results.push({ kind: 'person', name: w });
   }
 
   return results;
@@ -3152,44 +4189,12 @@ function renderEventAwards(awards) {
   const worldsDome   = isWorldsStyleEvent() && isDomeDivision();
   const DOME_ONLY    = new Set(['champion', 'finalist', 'excellence']);
 
-  // ── Prior-award loading state ──────────────────────────────────────────────
-  const priorLoading = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length === 0;
-  const priorReady   = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length > 0;
-  const priorPending = cachedPriorAwardScores === null;
-
   // ── Prediction helpers ─────────────────────────────────────────────────────
   function predExcellence() {
-    // Worlds Dome — show prior Excellence winners ranked by award score
+    // Worlds Dome note (no local ranking data available)
     if (worldsDome) {
-      const banner = `<div class="award-pred-note-block award-worlds-note">
+      return `<div class="award-pred-note-block award-worlds-note">
         <strong>VEX Worlds Dome:</strong> Excellence is awarded to a team from any division that won Excellence at a qualifying event this season.
-      </div>`;
-      if (priorPending || priorLoading) {
-        return banner + `<div class="award-pred-note-block">⏳ Loading qualifying Excellence winners…</div>`;
-      }
-      if (!cachedPriorExcellenceSet?.size) {
-        return banner + `<div class="award-pred-note-block">No prior Excellence winners found in loaded event history.</div>`;
-      }
-      const rows = [...cachedPriorExcellenceSet]
-        .map(name => ({ name, score: cachedPriorAwardScores?.[name] ?? 0 }))
-        .sort((a, b) => b.score - a.score)
-        .map((e, i) => {
-          const sk = cachedEventSkills[e.name];
-          return `<tr>
-            <td class="aw-rank">${i + 1}</td>
-            <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
-            <td class="aw-stat">${sk ? sk.driver + sk.prog : '—'}</td>
-            <td class="aw-stat aw-prior">${e.score.toFixed(2)}</td>
-          </tr>`;
-        }).join('');
-      return banner + `<div class="award-pred-section">
-        <div class="award-pred-title">Prior Excellence winners <span class="award-pred-note">(${cachedPriorExcellenceSet.size} eligible · by award history score)</span>
-          <span class="award-prior-ready">✓ History loaded</span>
-        </div>
-        <div class="table-wrap"><table class="award-table">
-          <thead><tr><th>#</th><th>Team</th><th>Skills</th><th>Award Score</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table></div>
       </div>`;
     }
 
@@ -3198,32 +4203,26 @@ function renderEventAwards(awards) {
     const eligible = awardsTop40Eligible();
     if (!eligible.length) return `<div class="award-pred-note-block">No teams currently meet the top-40% threshold across qual rank, combined skills, and auto skills.</div>`;
 
-    const priorNote = priorPending || priorLoading
-      ? `<span class="award-prior-loading">⏳ Loading award history…</span>`
-      : priorReady ? `<span class="award-prior-ready">✓ Award history included</span>` : '';
-
     const rows = eligible
       .map(name => ({ name, score: compositeAwardScore(name) }))
       .sort((a, b) => b.score - a.score)
       .map((e, i) => {
         const r  = cachedEventRankings[e.name];
         const sk = cachedEventSkills[e.name];
-        const priorRaw = priorReady ? (cachedPriorAwardScores?.[e.name] ?? null) : null;
         return `<tr>
           <td class="aw-rank">${i + 1}</td>
           <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
           <td class="aw-stat">Q${r?.rank ?? '—'}</td>
           <td class="aw-stat">${sk ? sk.driver + sk.prog : '—'}</td>
           <td class="aw-stat">${sk?.prog ?? '—'}</td>
-          ${priorReady ? `<td class="aw-stat aw-prior">${priorRaw != null ? priorRaw.toFixed(1) : '—'}</td>` : ''}
           <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${Math.round(e.score*100)}%"></div><span>${Math.round(e.score*100)}%</span></td>
         </tr>`;
       }).join('');
-    const weightNote = priorReady ? '35% qual · 30% skills · 20% auto · 15% history' : '40% qual · 35% skills · 25% auto';
+    const weightNote = '40% qual · 35% skills · 25% auto';
     return `<div class="award-pred-section">
-      <div class="award-pred-title">Eligible teams <span class="award-pred-note">(${weightNote})</span> ${priorNote}</div>
+      <div class="award-pred-title">Eligible teams <span class="award-pred-note">(${weightNote})</span></div>
       <div class="table-wrap"><table class="award-table">
-        <thead><tr><th>#</th><th>Team</th><th>Qual</th><th>Skills</th><th>Auto</th>${priorReady ? '<th>History</th>' : ''}<th>Score</th></tr></thead>
+        <thead><tr><th>#</th><th>Team</th><th>Qual</th><th>Skills</th><th>Auto</th><th>Score</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
     </div>`;
@@ -3408,15 +4407,9 @@ function renderEventAwards(awards) {
     ? (pastEvent ? 'Award winners were not entered in RobotEvents for this event.' : 'No awards announced yet.')
     : `${givenCount} awarded · ${pendingCount} ${pastEvent ? 'not recorded' : 'pending'}`;
 
-  const priorCacheKey = priorAwardsCacheKey(currentEvent?.program?.id, currentEvent?.season?.id);
-  const priorCached = (() => { try { const c = JSON.parse(localStorage.getItem(priorCacheKey)||'null'); return c?.ts ? new Date(c.ts).toLocaleTimeString() : null; } catch(_){ return null; } })();
-  const cacheNote = priorCached
-    ? ` · <span class="award-cache-note">History cached ${priorCached} · <button class="award-cache-bust" id="award-cache-bust">Refresh</button></span>`
-    : '';
-
   return `<div class="stats-section">
     <div class="section-title">Awards (${visible.length})</div>
-    <p class="sim-info">${statusNote}${cacheNote}</p>
+    <p class="sim-info">${statusNote}</p>
     <div class="awards-grid">${visible.map(renderAwardCard).join('')}</div>
   </div>`;
 }
@@ -3514,7 +4507,17 @@ function renderEventTeams(teams) {
 async function openSeasonsView(team) {
   currentTeam = team;
   showView('view-seasons');
-  document.getElementById('team-hero').innerHTML = teamHeroHTML(team, false);
+  const teamHeroEl = document.getElementById('team-hero');
+  teamHeroEl.innerHTML = teamHeroHTML(team, false);
+  teamHeroEl.querySelector('.follow-team-btn')?.addEventListener('click', () => {
+    if (isFollowingTeam(team.number)) {
+      unfollowTeam(team.number);
+    } else {
+      followTeam(team.number, team.team_name || team.number, team.program?.name || '');
+      addNotification(`Now following team ${team.number}`, 'info');
+    }
+    updateFollowButtons();
+  });
   clearStatus('seasons');
   document.getElementById('seasons-grid').innerHTML = '';
   setStatus('seasons', 'Loading season history…');
@@ -3673,10 +4676,13 @@ function renderTeamStats(events, rankings, skills, awards, worldEntry, pid, sid)
 
   el.innerHTML = [
     metricsHTML(events.length, bestRank, worldSkillsRank, awards.length, trueSkillScore),
+    events.length > 1 ? `<div class="stats-section"><div class="section-title">Season Event Map</div><div id="team-hist-map" class="team-hist-map"></div></div>` : '',
     teamRankingsHTML(rankings, eventMap),
     teamSkillsHTML(driver, prog, bestDriver, bestProg, worldEntry),
     teamAwardsHTML(awards),
   ].join('');
+
+  if (events.length > 1) initTeamHistoryMap(events, rankings);
 
   el.querySelectorAll('.clickable-row[data-event-id]').forEach(row => {
     const ev = eventMap[+row.dataset.eventId];
@@ -3686,6 +4692,75 @@ function renderTeamStats(events, rankings, skills, awards, worldEntry, pid, sid)
       openEventDetail(ev);
     });
   });
+}
+
+function initTeamHistoryMap(events, rankings) {
+  const container = document.getElementById('team-hist-map');
+  if (!container || typeof L === 'undefined') return;
+
+  // Destroy any prior Leaflet instance on this element
+  if (container._leaflet_id) {
+    const old = container._leaflet_map;
+    if (old) old.remove();
+  }
+
+  const map = L.map(container, { zoomControl: true, scrollWheelZoom: false });
+  container._leaflet_map = map;
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors', maxZoom: 18,
+  }).addTo(map);
+
+  // Ranking lookup: eventId → rank
+  const rankByEvent = {};
+  for (const r of rankings) {
+    if (r.event?.id) rankByEvent[r.event.id] = r.rank;
+  }
+  const allRanks = Object.values(rankByEvent).filter(Boolean);
+  const maxRank  = allRanks.length ? Math.max(...allRanks) : 50;
+
+  const markers = [];
+  for (const ev of events) {
+    let lat = ev.location?.coordinates?.lat;
+    let lon = ev.location?.coordinates?.lon;
+    if (lat == null || lon == null) {
+      const country = ev.location?.country;
+      if (country && COUNTRY_COORDS[country]) [lat, lon] = COUNTRY_COORDS[country];
+      else continue;
+    }
+
+    const rank   = rankByEvent[ev.id];
+    const pct    = rank != null ? (1 - (rank - 1) / Math.max(maxRank - 1, 1)) : 0.5;
+    // Green (rank 1) → yellow → red (last)
+    const hue    = Math.round(pct * 120);
+    const color  = `hsl(${hue},80%,42%)`;
+    const radius = rank === 1 ? 10 : rank != null && rank <= 3 ? 8 : 6;
+
+    const start  = ev.start ? new Date(ev.start).toLocaleDateString() : '—';
+    const loc    = [ev.location?.city, ev.location?.region].filter(Boolean).join(', ') || ev.location?.country || '—';
+    const tooltip = `<strong>${esc(ev.name)}</strong><br>${start} · ${loc}${rank != null ? '<br>Rank: #' + rank : ''}`;
+
+    const m = L.circleMarker([lat, lon], {
+      radius, fillColor: color, color: '#fff', weight: 1.5, fillOpacity: 0.9,
+    }).bindTooltip(tooltip, { direction: 'top', offset: [0, -4] });
+    m.on('click', () => openEventDetail(ev));
+    m.addTo(map);
+    markers.push([lat, lon]);
+  }
+
+  if (markers.length) {
+    map.fitBounds(L.latLngBounds(markers), { padding: [24, 24], maxZoom: 6 });
+  } else {
+    map.setView([20, 0], 2);
+  }
+
+  // Legend
+  container.insertAdjacentHTML('afterend', `
+    <div class="hist-map-legend">
+      <span style="color:#15803D">● Rank 1–3</span> &nbsp;
+      <span style="color:#D97706">● Mid</span> &nbsp;
+      <span style="color:#DC2626">● Bottom</span> &nbsp;
+      <span style="font-size:.72rem;color:var(--text-muted)">Click a pin to open event</span>
+    </div>`);
 }
 
 function metricsHTML(evCount, bestRank, worldSkillsRank, awardCount, trueSkill) {
@@ -3700,6 +4775,37 @@ function metricsHTML(evCount, bestRank, worldSkillsRank, awardCount, trueSkill) 
     ${m(worldSkillsRank ? `#${worldSkillsRank}` : null, 'World Skills')}
     ${m(awardCount, 'Awards')}
     ${trueSkill != null ? m(trueSkill.toFixed(2) + '<span style="font-size:.7rem;opacity:.55">/10</span>', 'Rating') : ''}
+  </div>`;
+}
+
+function rankTrajectoryChart(rankings, eventMap) {
+  const pts = [...rankings]
+    .filter(r => eventMap[r.event?.id])
+    .sort((a, b) => new Date(eventMap[a.event.id]?.start||0) - new Date(eventMap[b.event.id]?.start||0));
+  if (pts.length < 2) return '';
+  const ranks = pts.map(r => r.rank);
+  const maxR = Math.max(...ranks);
+  const W = 240, H = 54, pad = 10;
+  const xStep = (W - pad * 2) / (pts.length - 1);
+  const toY = r => pad + (r - 1) / Math.max(1, maxR - 1) * (H - pad * 2);
+  const pathD = pts.map((r, i) => `${i===0?'M':'L'}${(pad + i*xStep).toFixed(1)},${toY(r.rank).toFixed(1)}`).join(' ');
+  const fillD = pathD + ` L${(pad+(pts.length-1)*xStep).toFixed(1)},${H} L${pad},${H} Z`;
+  const dots = pts.map((r, i) => {
+    const x = (pad + i*xStep).toFixed(1), y = toY(r.rank).toFixed(1);
+    const ev = eventMap[r.event?.id];
+    return `<circle cx="${x}" cy="${y}" r="3.5" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.5"><title>${esc(ev?.name||'')} — Rank #${r.rank}</title></circle>`;
+  }).join('');
+  return `<div class="trajectory-wrap">
+    <div class="trajectory-label">Rank trajectory <span class="trajectory-note">${pts.length} events · hover for details · top = better</span></div>
+    <svg class="trajectory-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="overflow:visible">
+      <defs><linearGradient id="tg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--accent)" stop-opacity=".18"/><stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+      <line x1="${pad}" y1="${pad}" x2="${W-pad}" y2="${pad}" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,2"/>
+      <text x="${pad-2}" y="${pad+3}" fill="var(--text-muted)" font-size="7" text-anchor="end">#1</text>
+      <text x="${pad-2}" y="${H-pad+3}" fill="var(--text-muted)" font-size="7" text-anchor="end">#${maxR}</text>
+      <path d="${fillD}" fill="url(#tg)"/>
+      <path d="${pathD}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots}
+    </svg>
   </div>`;
 }
 
@@ -3734,6 +4840,7 @@ function teamRankingsHTML(rankings, eventMap) {
   return `
     <div class="stats-section">
       <div class="section-title">Event Rankings</div>
+      ${rankTrajectoryChart(rankings, eventMap)}
       <p class="match-hint">Click an event row to view full event details.</p>
       <div class="table-wrap">
         <table><thead><tr>
@@ -3783,18 +4890,37 @@ function teamAwardsHTML(awards) {
       <div class="section-title">Awards</div>
       <p class="empty">No awards this season.</p>
     </div>`;
-  const items = awards.map(a => {
+
+  const NOTEBOOK_TYPES = new Set(['excellence','design','think','innovate','amaze','build','create','judges']);
+  const notebook    = awards.filter(a => NOTEBOOK_TYPES.has(classifyAward(a.title)));
+  const performance = awards.filter(a => !NOTEBOOK_TYPES.has(classifyAward(a.title)));
+
+  function item(a) {
+    const type = classifyAward(a.title);
+    const info = AWARD_INFO[type] || AWARD_INFO.other;
     const evId = a.event?.id ?? '';
-    return `<div class="award-item${evId ? ' clickable-row' : ''}" data-event-id="${evId}">
-      <div class="award-title">🏆 ${esc(a.title)}</div>
-      <div class="award-event-name">${evId ? `<span class="event-link">${esc(a.event?.name || '—')}</span>` : esc(a.event?.name || '—')}</div>
+    return `<div class="pedigree-item${evId ? ' clickable-row' : ''}" data-event-id="${evId}">
+      <span class="pedigree-icon">${info.icon}</span>
+      <div class="pedigree-info">
+        <div class="pedigree-title">${esc(a.title)}</div>
+        <div class="pedigree-event">${evId ? `<span class="event-link">${esc(a.event?.name||'—')}</span>` : esc(a.event?.name||'—')}</div>
+      </div>
     </div>`;
-  }).join('');
-  return `
+  }
+
+  const notebookHtml = notebook.length ? `
     <div class="stats-section">
-      <div class="section-title">Awards (${awards.length})</div>
-      <div class="awards-list">${items}</div>
-    </div>`;
+      <div class="section-title">Notebook &amp; Judged Awards (${notebook.length})</div>
+      <div class="pedigree-list">${notebook.map(item).join('')}</div>
+    </div>` : '';
+
+  const perfHtml = performance.length ? `
+    <div class="stats-section">
+      <div class="section-title">Performance Awards (${performance.length})</div>
+      <div class="pedigree-list">${performance.map(item).join('')}</div>
+    </div>` : '';
+
+  return (notebookHtml + perfHtml) || `<div class="stats-section"><div class="section-title">Awards</div><p class="empty">No awards this season.</p></div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3803,6 +4929,7 @@ function teamAwardsHTML(awards) {
 
 function teamHeroHTML(t, clickable) {
   const loc = [t.location?.city, t.location?.region, t.location?.country].filter(Boolean).join(', ') || '—';
+  const following = isFollowingTeam(t.number);
   return `
     <div class="team-hero ${clickable ? 'clickable' : ''}">
       <div class="team-number">${esc(t.number)}</div>
@@ -3815,6 +4942,9 @@ function teamHeroHTML(t, clickable) {
         ${t.grade         ? mf('Grade',   t.grade)         : ''}
       </div>
       ${clickable ? '<div class="view-seasons-hint">Click to view season history →</div>' : ''}
+      ${!clickable ? `<button class="follow-team-btn ${following ? 'following' : ''}" data-num="${esc(t.number)}" data-name="${esc(t.team_name||t.number)}" data-prog="${esc(t.program?.name||'')}">
+        ${following ? 'Following ★' : 'Follow ☆'}
+      </button>` : ''}
     </div>`;
 }
 
@@ -3968,6 +5098,638 @@ function renderScheduleStrengthSection(teamName) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SNAKE DRAFT SIMULATOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+let draftState = null;
+
+function draftTeamScore(name) {
+  const w = getPickWeights();
+  const rows = buildPicklistRows(w);
+  if (!rows) return 0;
+  const entry = rows.find(r => r.name === name);
+  return entry ? entry.composite : 0;
+}
+
+function renderDraftSetup() {
+  const teams = Object.keys(cachedEventRankings);
+  if (!teams.length) return '<p class="empty">Load Rankings first to run a draft simulation.</p>';
+
+  const numTeams    = teams.length;
+  const numAlliances = Math.min(8, Math.max(2, Math.floor(numTeams / 2)));
+  const captains = [...teams]
+    .sort((a, b) => (cachedEventRankings[a]?.rank ?? 999) - (cachedEventRankings[b]?.rank ?? 999))
+    .slice(0, numAlliances);
+
+  const opts = captains.map((c, i) =>
+    `<button class="draft-seed-btn" data-seed="${i}">#${i+1} — ${esc(c)}</button>`
+  ).join('');
+
+  return `
+    <div class="stats-section">
+      <div class="section-title">Alliance Draft Simulator</div>
+      <p class="pl-info">Simulates a ${numAlliances}-alliance selection. Each alliance is 2 teams: a captain + 1 partner. Captains pick in seeding order (1 → ${numAlliances}). AI opponents pick by composite score.</p>
+      <div class="draft-seed-label">Choose your captain:</div>
+      <div class="draft-seed-grid">${opts}</div>
+    </div>`;
+}
+
+function wireDraftSetup(container) {
+  container.querySelectorAll('.draft-seed-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const seed = +btn.dataset.seed;
+      startDraft(seed, container);
+    });
+  });
+}
+
+function startDraft(yourSeed, container) {
+  const teams = Object.keys(cachedEventRankings);
+  // numAlliances = min(8, floor(teams/2)) — each alliance needs at least 2 teams
+  const numAlliances = Math.min(8, Math.max(2, Math.floor(teams.length / 3)));
+  const sorted = [...teams].sort((a, b) =>
+    (cachedEventRankings[a]?.rank ?? 999) - (cachedEventRankings[b]?.rank ?? 999));
+
+  const captains = sorted.slice(0, numAlliances);
+
+  // slots: one per captain, in seed order. skipped=true when a captain was picked as partner.
+  // partner: the team they picked.
+  // available: ALL teams except the current captain — including other captains.
+  draftState = {
+    yourSeed,
+    slots: captains.map((c, i) => ({ seed: i, captain: c, partner: null, skipped: false })),
+    allTeams: sorted,         // full sorted list; used to compute available each turn
+    pickedAsPartner: new Set(), // team names taken as partners
+    pickIdx: 0,               // index into slots (skip skipped slots)
+    done: false,
+  };
+
+  renderDraftBoard(container);
+  autoAdvanceAI(container);
+}
+
+// Returns the next slot index that hasn't been skipped, starting from pickIdx
+function nextActivePick(ds) {
+  let i = ds.pickIdx;
+  while (i < ds.slots.length && ds.slots[i].skipped) i++;
+  return i;
+}
+
+// All teams not yet committed to an alliance, except the team currently picking.
+// Excludes: teams already picked as partners, captains who already have a partner,
+// and skipped captains (they were picked as someone else's partner).
+function draftAvailable(ds) {
+  const pickingCaptain = ds.slots[ds.pickIdx]?.captain;
+  const doneCaptains = new Set(
+    ds.slots.filter(s => s.partner !== null || s.skipped).map(s => s.captain)
+  );
+  return ds.allTeams.filter(t =>
+    !ds.pickedAsPartner.has(t) &&
+    t !== pickingCaptain &&
+    !doneCaptains.has(t)
+  );
+}
+
+function aiPick(available) {
+  if (!available.length) return null;
+  const scored = available.map(n => ({ n, s: draftTeamScore(n) + (Math.random() - 0.5) * 3 }));
+  scored.sort((a, b) => b.s - a.s);
+  return scored[0].n;
+}
+
+function applyPick(name) {
+  const ds = draftState;
+  const slot = ds.slots[ds.pickIdx];
+  slot.partner = name;
+  ds.pickedAsPartner.add(name);
+
+  // If the picked team was another captain, mark their slot as skipped
+  const pickedSlot = ds.slots.find(s => s.captain === name);
+  if (pickedSlot) pickedSlot.skipped = true;
+
+  // Advance to next non-skipped slot
+  ds.pickIdx++;
+  ds.pickIdx = nextActivePick(ds);
+  if (ds.pickIdx >= ds.slots.length) ds.done = true;
+}
+
+function renderDraftBoard(container) {
+  const ds = draftState;
+
+  const allianceCards = ds.slots.map(sl => {
+    if (sl.skipped) return ''; // this captain was picked — don't show as its own alliance
+    const isYours = sl.seed === ds.yourSeed;
+    const rankOf  = n => cachedEventRankings[n]?.rank;
+    const oprOf   = n => cachedOPR[n]?.opr?.toFixed(1) ?? '—';
+    const captainRow = `
+      <div class="draft-member draft-captain">
+        <span class="draft-member-num">${esc(sl.captain)}</span>
+        <span class="draft-member-meta">#${rankOf(sl.captain) ?? '?'} · OPR ${oprOf(sl.captain)}</span>
+      </div>`;
+    const partnerRow = sl.partner ? `
+      <div class="draft-member">
+        <span class="draft-member-num">${esc(sl.partner)}</span>
+        <span class="draft-member-meta">#${rankOf(sl.partner) ?? '?'} · OPR ${oprOf(sl.partner)}</span>
+      </div>` : `<div class="draft-member-pending">awaiting pick…</div>`;
+    const totalOPR = [sl.captain, sl.partner].filter(Boolean)
+      .reduce((s, n) => s + (cachedOPR[n]?.opr ?? 0), 0);
+    return `
+      <div class="draft-alliance-card ${isYours ? 'draft-yours' : ''}">
+        <div class="draft-alliance-title">${isYours ? '⭐ ' : ''}Alliance ${sl.seed + 1}${isYours ? ' (You)' : ''}</div>
+        ${captainRow}${partnerRow}
+        ${sl.partner ? `<div class="draft-alliance-opr">Combined OPR: ${totalOPR.toFixed(1)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  let pickUI = '';
+  if (!ds.done) {
+    const curSlot   = ds.slots[ds.pickIdx];
+    const isYourTurn = curSlot?.seed === ds.yourSeed;
+    const available = draftAvailable(ds);
+
+    if (isYourTurn) {
+      const rows = available.map(n => {
+        const rank    = cachedEventRankings[n]?.rank;
+        const opr     = cachedOPR[n]?.opr?.toFixed(1) ?? '—';
+        const ccwm    = cachedOPR[n]?.ccwm?.toFixed(1) ?? '—';
+        const skills  = cachedEventSkills[n]?.combined ?? '—';
+        const score   = draftTeamScore(n).toFixed(1);
+        const isCap   = ds.slots.some(s => s.captain === n && !s.skipped);
+        return `<tr class="draft-avail-row ${isCap ? 'draft-row-captain' : ''}">
+          <td>${rank != null ? '#' + rank : '—'}${isCap ? ' <span class="draft-cap-tag">C</span>' : ''}</td>
+          <td><strong>${esc(n)}</strong>${hasScoutNote(n) ? ' <span class="scout-dot">●</span>' : ''}</td>
+          <td>${opr}</td><td>${ccwm}</td><td>${skills}</td>
+          <td class="draft-score-cell">${score}</td>
+          <td><button class="draft-pick-btn btn-primary" data-name="${esc(n)}">Pick</button></td>
+        </tr>`;
+      }).join('');
+      pickUI = `
+        <div class="draft-your-turn">Your pick — choose your alliance partner (C = another captain seed):</div>
+        <div class="table-wrap"><table class="draft-avail-table">
+          <thead><tr><th>Rank</th><th>Team</th><th>OPR</th><th>CCWM</th><th>Skills</th><th>Score</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>`;
+    } else {
+      pickUI = `<div class="draft-ai-turn">Alliance ${(curSlot?.seed ?? 0) + 1} is picking a partner…
+        <button class="btn-secondary draft-ai-btn" id="draft-ai-pick">Simulate pick</button></div>`;
+    }
+  } else {
+    const activeSlots = ds.slots.filter(s => !s.skipped && s.partner);
+    const yourSlot = activeSlots.find(s => s.seed === ds.yourSeed);
+    const yourLabel = yourSlot ? `Alliance ${ds.yourSeed + 1}` : null;
+    const allianceObjs = activeSlots.map(s => ({
+      label: `Alliance ${s.seed + 1}`,
+      teams: [s.captain, s.partner],
+    }));
+    const bracketHTML = allianceObjs.length >= 2
+      ? renderSimBracket(allianceObjs, yourLabel)
+      : '';
+    pickUI = `
+      <div class="draft-done">
+        Draft complete!
+        <button class="btn-secondary" id="draft-restart" style="margin-left:12px">Start over</button>
+      </div>
+      ${bracketHTML}`;
+  }
+
+  container.innerHTML = `
+    <div class="stats-section">
+      <div class="section-title">Alliance Draft${ds.done ? ' — Complete' : ''}</div>
+      <div class="draft-alliances">${allianceCards}</div>
+      <div class="draft-pick-area">${pickUI}</div>
+    </div>`;
+
+  container.querySelectorAll('.draft-pick-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      applyPick(btn.dataset.name);
+      renderDraftBoard(container);
+      autoAdvanceAI(container);
+    });
+  });
+  container.querySelector('#draft-ai-pick')?.addEventListener('click', () => {
+    applyPick(aiPick(draftAvailable(draftState)));
+    renderDraftBoard(container);
+    autoAdvanceAI(container);
+  });
+  container.querySelector('#draft-restart')?.addEventListener('click', () => {
+    draftState = null;
+    container.innerHTML = renderDraftSetup();
+    wireDraftSetup(container);
+  });
+}
+
+function autoAdvanceAI(container) {
+  const ds = draftState;
+  if (!ds || ds.done) return;
+  const curSlot = ds.slots[ds.pickIdx];
+  if (curSlot && curSlot.seed !== ds.yourSeed) {
+    setTimeout(() => {
+      if (!draftState || draftState.done) return;
+      applyPick(aiPick(draftAvailable(draftState)));
+      renderDraftBoard(container);
+      autoAdvanceAI(container);
+    }, 700);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTO-SCOUT PICK LIST
+// ═══════════════════════════════════════════════════════════════════════════
+
+function picklistExcludedKey(eid) { return `picklist_excl_${eid}`; }
+function getExcluded(eid) {
+  try { return new Set(JSON.parse(localStorage.getItem(picklistExcludedKey(eid)) || '[]')); } catch (_) { return new Set(); }
+}
+function saveExcluded(eid, set) { localStorage.setItem(picklistExcludedKey(eid), JSON.stringify([...set])); }
+
+const PL_WEIGHT_KEY = 'picklist_weights';
+const PL_WEIGHT_DEFAULTS = { opr: 30, ccwm: 20, winRate: 15, auton: 15, skills: 10, consistency: 10 };
+function getPickWeights() {
+  try { return { ...PL_WEIGHT_DEFAULTS, ...JSON.parse(localStorage.getItem(PL_WEIGHT_KEY) || '{}') }; } catch (_) { return { ...PL_WEIGHT_DEFAULTS }; }
+}
+function savePickWeights(w) { localStorage.setItem(PL_WEIGHT_KEY, JSON.stringify(w)); }
+
+// Build per-team stats from raw match data for richer pick list scoring
+function buildPicklistStats() {
+  const stats = {}; // name -> { scores[], apPerMatch, allianceAvg, gamesPlayed }
+  for (const m of cachedEventMatches) {
+    if (m.round !== 2 || !matchIsScored(m)) continue;
+    for (const a of (m.alliances || [])) {
+      const score = a.score ?? 0;
+      const ap    = a.teams?.reduce((s, t) => s + (t.sit_out ? 0 : (a.autonomous_points ?? 0) / (a.teams?.length || 1)), 0) ?? 0;
+      // partner avg: total alliance score excluding this team's OPR contribution
+      for (const t of (a.teams || [])) {
+        const name = t.team?.name;
+        if (!name) continue;
+        if (!stats[name]) stats[name] = { scores: [], apTotal: 0, gamesPlayed: 0 };
+        stats[name].scores.push(score);
+        stats[name].apTotal  += ap;
+        stats[name].gamesPlayed++;
+      }
+    }
+  }
+  // Compute derived fields
+  for (const [, s] of Object.entries(stats)) {
+    const n = s.scores.length;
+    const mean = n ? s.scores.reduce((a, b) => a + b, 0) / n : 0;
+    const variance = n > 1 ? s.scores.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0;
+    const cv = mean > 0 ? Math.sqrt(variance) / mean : 1; // coefficient of variation: lower = more consistent
+    s.mean = mean;
+    s.consistency = Math.max(0, 1 - cv);   // 0-1, higher = more consistent
+    s.apPerMatch  = s.gamesPlayed ? s.apTotal / s.gamesPlayed : 0;
+  }
+  return stats;
+}
+
+// Normalize array of raw values to 0-100 percentile ranks (handles ties, null-safe)
+function percentileRank(values) {
+  const valid = values.filter(v => v != null && isFinite(v)).sort((a, b) => a - b);
+  if (!valid.length) return values.map(() => 50);
+  return values.map(v => {
+    if (v == null || !isFinite(v)) return 50;
+    const below = valid.filter(x => x < v).length;
+    return valid.length > 1 ? (below / (valid.length - 1)) * 100 : 50;
+  });
+}
+
+function buildPicklistRows(weights) {
+  const teams = Object.keys(cachedEventRankings);
+  if (!teams.length) return null;
+
+  const matchStats = buildPicklistStats();
+
+  // Raw values per team for each dimension
+  const raw = teams.map(name => {
+    const r = cachedEventRankings[name] || {};
+    const o = cachedOPR[name] || {};
+    const sk = cachedEventSkills[name] || {};
+    const ms = matchStats[name] || {};
+    return {
+      name,
+      opr:         o.opr          ?? null,
+      ccwm:        o.ccwm         ?? null,
+      winRate:     r.winRate      ?? null,
+      auton:       ms.apPerMatch  ?? (r.ap != null && r.wins + r.losses + r.ties > 0
+                     ? r.ap / (r.wins + r.losses + r.ties) : null),
+      skills:      sk.combined    ?? null,
+      consistency: ms.consistency ?? null,
+      // display-only
+      rank:        r.rank,
+      dpr:         o.dpr          ?? null,
+      maxScore:    r.max_score    ?? null,
+      wp:          r.wp           ?? null,
+      ap:          r.ap           ?? null,
+      sp:          r.sp           ?? null,
+      gamesPlayed: ms.gamesPlayed ?? 0,
+      hasNotes:    hasScoutNote(name),
+    };
+  });
+
+  // Compute percentile ranks for each scored dimension
+  const dims = ['opr', 'ccwm', 'winRate', 'auton', 'skills', 'consistency'];
+  const pctiles = {};
+  dims.forEach(dim => {
+    const vals = raw.map(r => r[dim]);
+    const pcts = percentileRank(vals);
+    pctiles[dim] = {};
+    raw.forEach((r, i) => { pctiles[dim][r.name] = pcts[i]; });
+  });
+
+  const totalWeight = dims.reduce((s, d) => s + (weights[d] || 0), 0) || 1;
+
+  return raw.map(r => {
+    const composite = dims.reduce((s, d) =>
+      s + (pctiles[d][r.name] * (weights[d] || 0)), 0) / totalWeight;
+    return { ...r, composite, pctiles: Object.fromEntries(dims.map(d => [d, pctiles[d][r.name]])) };
+  }).sort((a, b) => b.composite - a.composite);
+}
+
+function renderPickWeightsPanel(weights) {
+  const dims = [
+    { key: 'opr',         label: 'OPR',           tip: 'Offensive Power Rating — expected scoring contribution per match' },
+    { key: 'ccwm',        label: 'CCWM',          tip: 'Contribution to Winning Margin — how much they push the score past opponents' },
+    { key: 'winRate',     label: 'Win Rate',       tip: 'Qualification record win percentage' },
+    { key: 'auton',       label: 'Auton (AP/match)',tip: 'Average autonomous points earned per qualification match' },
+    { key: 'skills',      label: 'Skills',         tip: 'Combined skills score — reflects individual robot capability' },
+    { key: 'consistency', label: 'Consistency',    tip: 'Low score variance — reliable teams that show up every match' },
+  ];
+  const total = dims.reduce((s, d) => s + weights[d.key], 0);
+  return `
+    <div class="pl-weights-panel" id="pl-weights-panel">
+      <div class="pl-weights-header">
+        <span class="pl-weights-title">Scoring Weights <span class="pl-weights-total" id="pl-weights-total">(${total}%)</span></span>
+        <button class="pl-weights-reset" id="pl-weights-reset">Reset defaults</button>
+      </div>
+      <div class="pl-weights-grid">
+        ${dims.map(d => `
+          <div class="pl-weight-row" title="${esc(d.tip)}">
+            <label class="pl-weight-label">${esc(d.label)}</label>
+            <input class="pl-weight-slider" type="range" min="0" max="60" step="5"
+              data-dim="${d.key}" value="${weights[d.key]}">
+            <span class="pl-weight-val" id="pl-wval-${d.key}">${weights[d.key]}%</span>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function renderPickList(eid) {
+  const excluded = getExcluded(eid);
+  const teams    = Object.keys(cachedEventRankings);
+  if (!teams.length) return '<p class="empty">Load Rankings first to generate a pick list.</p>';
+
+  const weights = getPickWeights();
+  const rows_data = buildPicklistRows(weights);
+  if (!rows_data) return '<p class="empty">No ranking data available.</p>';
+
+  const rows = rows_data.map((t, i) => {
+    const isExcl    = excluded.has(t.name);
+    const pickNum   = isExcl ? '—' : '#' + (rows_data.filter((x, j) => j < i && !excluded.has(x.name)).length + 1);
+    const barPct    = t.composite.toFixed(1);
+    const barColor  = t.composite >= 75 ? '#15803D' : t.composite >= 50 ? 'var(--accent)' : t.composite >= 25 ? '#D97706' : '#9CA3AF';
+
+    // Mini percentile pips for each dimension
+    const pips = ['opr','ccwm','winRate','auton','skills','consistency'].map(d => {
+      const pct = t.pctiles[d];
+      const col = pct >= 75 ? '#15803D' : pct >= 50 ? 'var(--accent)' : pct >= 25 ? '#D97706' : '#9CA3AF';
+      return `<span class="pl-pip" style="background:${col}" title="${d}: ${pct.toFixed(0)}th pct"></span>`;
+    }).join('');
+
+    return `<tr class="pl-row ${isExcl ? 'pl-excluded' : ''}" data-num="${esc(t.name)}">
+      <td class="pl-pick-num">${pickNum}</td>
+      <td class="pl-name-cell">
+        <button class="team-link pl-team-name" data-num="${esc(t.name)}">${esc(t.name)}</button>
+        ${t.hasNotes ? '<span class="scout-dot" title="Has scouting notes">●</span>' : ''}
+      </td>
+      <td class="pl-rank">${t.rank != null ? '#' + t.rank : '—'}</td>
+      <td>${t.opr   != null ? t.opr.toFixed(1)  : '—'}</td>
+      <td>${t.ccwm  != null ? t.ccwm.toFixed(1) : '—'}</td>
+      <td>${t.winRate != null ? Math.round(t.winRate * 100) + '%' : '—'}</td>
+      <td>${t.auton != null ? t.auton.toFixed(1) : '—'}</td>
+      <td>${t.skills || '—'}</td>
+      <td>${t.consistency != null ? Math.round(t.consistency * 100) + '%' : '—'}</td>
+      <td class="pl-pips-cell">${pips}</td>
+      <td class="pl-bar-cell">
+        <div class="pl-bar-wrap">
+          <div class="pl-bar-fill" style="width:${barPct}%;background:${barColor}"></div>
+        </div>
+        <span class="pl-score-num">${barPct}</span>
+      </td>
+      <td><button class="pl-excl-btn btn-secondary" data-num="${esc(t.name)}">${isExcl ? 'Restore' : 'Picked'}</button></td>
+    </tr>`;
+  }).join('');
+
+  const available = rows_data.filter(t => !excluded.has(t.name)).length;
+  return `
+    ${renderPickWeightsPanel(weights)}
+    <div class="stats-section">
+      <div class="section-title">Pick List
+        <span class="pl-subtitle">${available} available · ${rows_data.length - available} picked</span>
+      </div>
+      <p class="pl-info">Each stat is converted to a percentile rank among all teams at this event, then combined using your weights above.
+        <strong>Color pips</strong>: green = top 25% · orange = top 50% · amber = top 75% · grey = bottom 25%.
+        Click "Picked" to remove a team from the order.</p>
+      <div class="table-wrap">
+        <table class="pl-table">
+          <thead><tr>
+            <th>Pick</th><th>Team</th><th>Rank</th><th>OPR</th><th>CCWM</th>
+            <th>Win%</th><th>AP/M</th><th>Skills</th><th>Consist.</th>
+            <th title="Percentile breakdown per stat">Pcts</th><th>Score</th><th></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <button class="btn-secondary pl-reset-btn" id="pl-reset" style="margin-top:10px">Reset all picks</button>
+    </div>`;
+}
+
+function wirePickList(container, eid) {
+  // Weight sliders
+  container.querySelectorAll('.pl-weight-slider').forEach(slider => {
+    slider.addEventListener('input', () => {
+      const w = getPickWeights();
+      w[slider.dataset.dim] = +slider.value;
+      savePickWeights(w);
+      const valEl = container.querySelector(`#pl-wval-${slider.dataset.dim}`);
+      if (valEl) valEl.textContent = slider.value + '%';
+      const total = Object.values(w).reduce((a, b) => a + b, 0);
+      const totEl = container.querySelector('#pl-weights-total');
+      if (totEl) totEl.textContent = `(${total}%)`;
+      // Re-render table body only (not the whole panel) for snappy response
+      const tbody = container.querySelector('.pl-table tbody');
+      const excluded = getExcluded(eid);
+      if (tbody) {
+        const newRows = buildPicklistRows(w);
+        if (newRows) {
+          tbody.innerHTML = newRows.map((t, i) => {
+            const isExcl  = excluded.has(t.name);
+            const pickNum = isExcl ? '—' : '#' + (newRows.filter((x, j) => j < i && !excluded.has(x.name)).length + 1);
+            const barPct  = t.composite.toFixed(1);
+            const barColor = t.composite >= 75 ? '#15803D' : t.composite >= 50 ? 'var(--accent)' : t.composite >= 25 ? '#D97706' : '#9CA3AF';
+            const pips = ['opr','ccwm','winRate','auton','skills','consistency'].map(d => {
+              const pct = t.pctiles[d];
+              const col = pct >= 75 ? '#15803D' : pct >= 50 ? 'var(--accent)' : pct >= 25 ? '#D97706' : '#9CA3AF';
+              return `<span class="pl-pip" style="background:${col}" title="${d}: ${pct.toFixed(0)}th pct"></span>`;
+            }).join('');
+            return `<tr class="pl-row ${isExcl ? 'pl-excluded' : ''}" data-num="${esc(t.name)}">
+              <td class="pl-pick-num">${pickNum}</td>
+              <td class="pl-name-cell">
+                <button class="team-link pl-team-name" data-num="${esc(t.name)}">${esc(t.name)}</button>
+                ${t.hasNotes ? '<span class="scout-dot" title="Has scouting notes">●</span>' : ''}
+              </td>
+              <td class="pl-rank">${t.rank != null ? '#' + t.rank : '—'}</td>
+              <td>${t.opr   != null ? t.opr.toFixed(1)  : '—'}</td>
+              <td>${t.ccwm  != null ? t.ccwm.toFixed(1) : '—'}</td>
+              <td>${t.winRate != null ? Math.round(t.winRate * 100) + '%' : '—'}</td>
+              <td>${t.auton != null ? t.auton.toFixed(1) : '—'}</td>
+              <td>${t.skills || '—'}</td>
+              <td>${t.consistency != null ? Math.round(t.consistency * 100) + '%' : '—'}</td>
+              <td class="pl-pips-cell">${pips}</td>
+              <td class="pl-bar-cell">
+                <div class="pl-bar-wrap"><div class="pl-bar-fill" style="width:${barPct}%;background:${barColor}"></div></div>
+                <span class="pl-score-num">${barPct}</span>
+              </td>
+              <td><button class="pl-excl-btn btn-secondary" data-num="${esc(t.name)}">${isExcl ? 'Restore' : 'Picked'}</button></td>
+            </tr>`;
+          }).join('');
+          wirePickListRows(container, eid);
+        }
+      }
+    });
+  });
+
+  container.querySelector('#pl-weights-reset')?.addEventListener('click', () => {
+    savePickWeights({ ...PL_WEIGHT_DEFAULTS });
+    container.innerHTML = renderPickList(eid);
+    wirePickList(container, eid);
+  });
+
+  container.querySelector('#pl-reset')?.addEventListener('click', () => {
+    saveExcluded(eid, new Set());
+    container.innerHTML = renderPickList(eid);
+    wirePickList(container, eid);
+  });
+
+  wirePickListRows(container, eid);
+}
+
+function wirePickListRows(container, eid) {
+  container.querySelectorAll('.pl-excl-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const excl = getExcluded(eid);
+      const num = btn.dataset.num;
+      if (excl.has(num)) excl.delete(num); else excl.add(num);
+      saveExcluded(eid, excl);
+      container.innerHTML = renderPickList(eid);
+      wirePickList(container, eid);
+    });
+  });
+  container.querySelectorAll('.pl-team-name[data-num]').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); openTeamEventView(btn.dataset.num); });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCOUTING NOTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function scoutKey(teamNumber) { return `scout_${teamNumber}`; }
+
+function getScoutNote(teamNumber) {
+  try { return JSON.parse(localStorage.getItem(scoutKey(teamNumber)) || 'null') || {}; } catch (_) { return {}; }
+}
+function saveScoutNote(teamNumber, note) {
+  localStorage.setItem(scoutKey(teamNumber), JSON.stringify({ ...note, ts: Date.now() }));
+}
+function hasScoutNote(teamNumber) {
+  const n = getScoutNote(teamNumber);
+  return !!(n.auto || n.intake || n.endgame || n.driver || n.notes || n.rating);
+}
+
+function renderScoutingNotesSection(teamNumber) {
+  const n = getScoutNote(teamNumber);
+  const starBar = () => [1,2,3,4,5].map(i =>
+    `<button class="scout-star ${(n.rating||0) >= i ? 'lit' : ''}" data-val="${i}">★</button>`
+  ).join('');
+
+  return `
+    <div class="stats-section scout-section" id="scout-notes-section">
+      <div class="section-title">Scouting Notes — ${esc(teamNumber)}
+        ${hasScoutNote(teamNumber) ? '<span class="scout-saved-badge">Saved</span>' : ''}
+      </div>
+      <div class="scout-rating-row">
+        <span class="scout-field-label">Overall</span>
+        <div class="scout-stars" id="scout-stars">${starBar()}</div>
+      </div>
+      <div class="scout-grid">
+        <label class="scout-field">
+          <span class="scout-field-label">Autonomous</span>
+          <input class="scout-input" id="scout-auto" type="text" placeholder="e.g. consistent 2-ball auton" value="${esc(n.auto||'')}">
+        </label>
+        <label class="scout-field">
+          <span class="scout-field-label">Intake / Mechanism</span>
+          <input class="scout-input" id="scout-intake" type="text" placeholder="e.g. fast roller, drops often" value="${esc(n.intake||'')}">
+        </label>
+        <label class="scout-field">
+          <span class="scout-field-label">Driver Skill</span>
+          <input class="scout-input" id="scout-driver" type="text" placeholder="e.g. very consistent, plays defense" value="${esc(n.driver||'')}">
+        </label>
+        <label class="scout-field">
+          <span class="scout-field-label">Endgame</span>
+          <input class="scout-input" id="scout-endgame" type="text" placeholder="e.g. reliable hang, ~8pts" value="${esc(n.endgame||'')}">
+        </label>
+      </div>
+      <label class="scout-field scout-notes-field">
+        <span class="scout-field-label">Free Notes</span>
+        <textarea class="scout-textarea" id="scout-notes" rows="3" placeholder="Anything else…">${esc(n.notes||'')}</textarea>
+      </label>
+      <div class="scout-actions">
+        <button class="btn-primary scout-save-btn" id="scout-save">Save Notes</button>
+        <button class="btn-secondary scout-clear-btn" id="scout-clear">Clear</button>
+        <span class="scout-ts" id="scout-ts">${n.ts ? 'Last saved ' + timeAgo(n.ts) : ''}</span>
+      </div>
+    </div>`;
+}
+
+function wireScoutingNotes(container, teamNumber) {
+  let rating = getScoutNote(teamNumber).rating || 0;
+
+  container.querySelectorAll('.scout-star').forEach(btn => {
+    btn.addEventListener('click', () => {
+      rating = +btn.dataset.val;
+      container.querySelectorAll('.scout-star').forEach(s =>
+        s.classList.toggle('lit', +s.dataset.val <= rating));
+    });
+  });
+
+  container.getElementById?.('scout-save') || container.querySelector('#scout-save')
+    ?.addEventListener('click', () => {
+      const note = {
+        rating,
+        auto:    container.querySelector('#scout-auto')?.value || '',
+        intake:  container.querySelector('#scout-intake')?.value || '',
+        driver:  container.querySelector('#scout-driver')?.value || '',
+        endgame: container.querySelector('#scout-endgame')?.value || '',
+        notes:   container.querySelector('#scout-notes')?.value || '',
+      };
+      saveScoutNote(teamNumber, note);
+      const ts = container.querySelector('#scout-ts');
+      if (ts) ts.textContent = 'Saved just now';
+      const badge = container.querySelector('.scout-saved-badge');
+      if (!badge) {
+        const title = container.querySelector('.section-title');
+        if (title) title.insertAdjacentHTML('beforeend', '<span class="scout-saved-badge">Saved</span>');
+      }
+    });
+
+  container.querySelector('#scout-clear')?.addEventListener('click', () => {
+    localStorage.removeItem(scoutKey(teamNumber));
+    const section = container.querySelector('#scout-notes-section');
+    if (section) { section.outerHTML = renderScoutingNotesSection(teamNumber); wireScoutingNotes(container, teamNumber); }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // TEAM AT EVENT VIEW
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4012,7 +5774,7 @@ async function openTeamEventView(teamNumber) {
       cachedEventMatches = await fetchAllPages(`/events/${currentEvent.id}/divisions/${activeDiv}/matches`);
     }
     if (!Object.keys(cachedOPR).length && cachedEventMatches.length) {
-      cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2));
+      cachedOPR = computeOPR(cachedEventMatches.filter(m => m.round === 2)); _predStatCache = null;
     }
     if (!Object.keys(cachedOPR).length && !Object.keys(cachedSeasonOPR).length) {
       loadSeasonOPR().catch(() => {});
@@ -4034,9 +5796,11 @@ async function openTeamEventView(teamNumber) {
     clearStatus('team-event');
     const { html: schedHtml, sorted: schedSorted } = renderTeamEventSchedule(teamMatches, teamNumber, histData);
     contentEl.innerHTML =
+      renderScoutingNotesSection(teamNumber) +
       renderPredWeightsPanel() +
       renderScheduleStrengthSection(teamNumber) +
       '<div id="team-sched-container">' + schedHtml + '</div>';
+    wireScoutingNotes(contentEl, teamNumber);
 
     const wireTeamLinks = el => {
       el.querySelectorAll('.team-link[data-num]').forEach(btn => {
@@ -4138,6 +5902,101 @@ function buildSkillsCache(data) {
     sk.combined   = sk.driver + sk.prog;
     sk.normalized = sk.combined / maxCombined;
   }
+}
+
+// ── Prediction Accuracy Tracker ───────────────────────────────────────────
+function renderPredictionAccuracy(matches) {
+  const quals = matches.filter(m => m.round === 2 && matchIsScored(m));
+  if (quals.length < 3) return '';
+
+  let correct = 0, total = 0;
+  // Confidence buckets: [0-59%, 60-74%, 75-87%]
+  const buckets = [
+    { label: '< 60%',  min: 0,  max: 60,  c: 0, t: 0 },
+    { label: '60–74%', min: 60, max: 75,  c: 0, t: 0 },
+    { label: '75%+',   min: 75, max: 100, c: 0, t: 0 },
+  ];
+  const byMatch = [];
+
+  for (const m of quals) {
+    const pred = predictMatch(m);
+    if (!pred) continue;
+    const alliances = m.alliances || [];
+    const red  = alliances.find(a => a.color === 'red');
+    const blue = alliances.find(a => a.color === 'blue');
+    if (!red || !blue) continue;
+
+    const actualWinner = red.score > blue.score ? 'red' : blue.score > red.score ? 'blue' : 'tie';
+    const predWinner   = pred.winner;
+    const hit = actualWinner === predWinner ||
+                (actualWinner === 'tie' && predWinner === 'tie');
+    if (hit) correct++;
+    total++;
+
+    const bucket = buckets.find(b => pred.confidence >= b.min && pred.confidence < b.max)
+                   ?? buckets[buckets.length - 1];
+    bucket.t++;
+    if (hit) bucket.c++;
+
+    byMatch.push({ num: m.matchnum, hit, confidence: pred.confidence, pred: predWinner, actual: actualWinner });
+  }
+
+  if (!total) return '';
+
+  const pct = Math.round(correct / total * 100);
+  const barColor = pct >= 70 ? '#15803D' : pct >= 55 ? '#D97706' : '#DC2626';
+
+  // Running accuracy line chart (SVG)
+  const W = 320, H = 52, pad = { l: 28, r: 8, t: 6, b: 14 };
+  const iW = W - pad.l - pad.r, iH = H - pad.t - pad.b;
+  let running = 0;
+  const pts = byMatch.map((m, i) => {
+    if (m.hit) running++;
+    return { x: pad.l + (i / Math.max(byMatch.length - 1, 1)) * iW, y: pad.t + (1 - running / (i + 1)) * iH };
+  });
+  const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const fillD = pathD + ` L${pts[pts.length-1].x.toFixed(1)},${pad.t+iH} L${pad.l},${pad.t+iH} Z`;
+
+  // Gridlines at 50% and 75%
+  const y50 = pad.t + 0.5 * iH, y75 = pad.t + 0.25 * iH;
+  const chart = `
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="acc-chart-svg">
+      <line x1="${pad.l}" y1="${y75.toFixed(1)}" x2="${W-pad.r}" y2="${y75.toFixed(1)}" stroke="var(--border)" stroke-width="0.7" stroke-dasharray="3,2"/>
+      <line x1="${pad.l}" y1="${y50.toFixed(1)}" x2="${W-pad.r}" y2="${y50.toFixed(1)}" stroke="var(--border)" stroke-width="0.7" stroke-dasharray="3,2"/>
+      <text x="${pad.l-3}" y="${(y75+3).toFixed(1)}" fill="var(--text-muted)" font-size="7" text-anchor="end">75%</text>
+      <text x="${pad.l-3}" y="${(y50+3).toFixed(1)}" fill="var(--text-muted)" font-size="7" text-anchor="end">50%</text>
+      <path d="${fillD}" fill="var(--accent)" fill-opacity="0.12"/>
+      <path d="${pathD}" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linejoin="round"/>
+      ${pts.map((p, i) => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.5" fill="${byMatch[i].hit ? 'var(--accent)' : '#DC2626'}" stroke="var(--bg)" stroke-width="1">
+        <title>Q${byMatch[i].num}: ${byMatch[i].hit ? '✓' : '✗'} (conf. ${byMatch[i].confidence}%)</title></circle>`).join('')}
+    </svg>`;
+
+  const bucketRows = buckets.filter(b => b.t > 0).map(b => {
+    const bPct = Math.round(b.c / b.t * 100);
+    return `<tr>
+      <td>${esc(b.label)}</td>
+      <td>${b.c}/${b.t}</td>
+      <td><div class="acc-bucket-bar"><div style="width:${bPct}%;background:${bPct>=70?'#15803D':bPct>=55?'#D97706':'#DC2626'}"></div></div></td>
+      <td style="font-weight:700;color:${bPct>=70?'#15803D':bPct>=55?'#D97706':'#DC2626'}">${bPct}%</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="stats-section acc-section">
+      <div class="section-title">Prediction Accuracy</div>
+      <div class="acc-summary">
+        <div class="acc-big-num" style="color:${barColor}">${pct}%</div>
+        <div class="acc-big-label">${correct} of ${total} qual matches predicted correctly</div>
+        <div class="acc-note">Using current OPR/CCWM weights · dot = match (green=correct, red=wrong)</div>
+      </div>
+      <div class="acc-chart">${chart}</div>
+      <div class="table-wrap" style="margin-top:10px">
+        <table style="font-size:.82rem">
+          <thead><tr><th>Confidence</th><th>Correct</th><th>Bar</th><th>%</th></tr></thead>
+          <tbody>${bucketRows}</tbody>
+        </table>
+      </div>
+    </div>`;
 }
 
 // Returns [{label, redScore, blueScore}] showing how the prediction for targetMatch evolved
@@ -4473,6 +6332,7 @@ async function addCompareTeam(number) {
       awards,
       worldEntry,
       avgOPR,
+      allMatches,
     };
 
     // Place in first empty slot
@@ -4683,6 +6543,8 @@ function renderCompareContent() {
     row('Championships',     d => d.championCount  || '—'),
   ].join('');
 
+  const h2hHtml = active.length >= 2 ? renderHeadToHead(active) : '';
+
   el.innerHTML = `
     <div class="cmp-radar-row">${radarCards}</div>
     <div class="cmp-table-wrap">
@@ -4699,7 +6561,8 @@ function renderCompareContent() {
         <tbody>${tableRows}</tbody>
       </table>
     </div>
-    <div class="cmp-cards-row">${headers}</div>`;
+    <div class="cmp-cards-row">${headers}</div>
+    ${h2hHtml}`;
 
   // Wire remove buttons
   el.querySelectorAll('.cmp-remove-btn').forEach(btn => {
@@ -4710,4 +6573,335 @@ function renderCompareContent() {
   el.querySelectorAll('.cmp-team-num[data-num]').forEach(btn => {
     btn.addEventListener('click', () => goToTeam(btn.dataset.num));
   });
+}
+
+function renderHeadToHead(active) {
+  const slots = active.map(d => compareState.slots[d.i]).filter(s => s?.allMatches?.length);
+  if (slots.length < 2) return '';
+  const nums = slots.map(s => s.team.number);
+
+  // Collect all matches across all slots, deduplicated by ID
+  const matchPool = new Map();
+  for (const s of slots) {
+    for (const m of s.allMatches) {
+      if (!matchPool.has(m.id)) matchPool.set(m.id, m);
+    }
+  }
+
+  // Keep only matches where ≥2 compared teams appear
+  const shared = [...matchPool.values()].filter(m => {
+    const present = (m.alliances || []).flatMap(a => (a.teams || []).map(t => t.team?.name));
+    return nums.filter(n => present.includes(n)).length >= 2;
+  });
+
+  const title = nums.length === 2
+    ? `Head-to-Head: ${esc(nums[0])} vs ${esc(nums[1])}`
+    : `Shared Matches — ${nums.join(', ')}`;
+
+  if (!shared.length) return `
+    <div class="stats-section">
+      <div class="section-title">${title}</div>
+      <p class="empty">No matches found where 2 or more of these teams appeared together this season.</p>
+    </div>`;
+
+  shared.sort((a, b) =>
+    (a.event?.name || '').localeCompare(b.event?.name || '') ||
+    (a.round - b.round) || (a.matchnum - b.matchnum)
+  );
+
+  // Pairwise W/L tracker: key = sorted "numA|numB"
+  const pairKey = (a, b) => [a, b].sort().join('|');
+  const pairs = {};
+  for (let i = 0; i < nums.length; i++) {
+    for (let j = i + 1; j < nums.length; j++) {
+      const k = pairKey(nums[i], nums[j]);
+      pairs[k] = { numA: [nums[i], nums[j]].sort()[0], numB: [nums[i], nums[j]].sort()[1], wA: 0, wB: 0, ties: 0 };
+    }
+  }
+
+  // Build match table rows
+  const rows = shared.map(m => {
+    const alliances = m.alliances || [];
+    const scored = matchIsScored(m);
+    const teamAl = {};
+    for (const a of alliances) {
+      for (const t of (a.teams || [])) {
+        if (t.team?.name) teamAl[t.team.name] = a;
+      }
+    }
+
+    // Per-team outcome cells
+    const teamCells = nums.map(num => {
+      const al = teamAl[num];
+      if (!al) return `<td class="h2h-absent">—</td>`;
+      const oppAl = alliances.find(a => a.color !== al.color);
+      const dot = al.color === 'red' ? '<span class="h2h-dot-red">●</span>' : '<span class="h2h-dot-blue">●</span>';
+      if (!scored || !oppAl) return `<td>${dot}</td>`;
+      const mine = al.score, opp = oppAl.score;
+      if (mine > opp)  return `<td class="h2h-win">${dot} W</td>`;
+      if (mine < opp)  return `<td class="h2h-loss">${dot} L</td>`;
+      return `<td class="h2h-tie">${dot} T</td>`;
+    });
+
+    // Update pairwise records for opposing teams that both appeared
+    if (scored) {
+      const present = nums.filter(n => teamAl[n]);
+      for (let i = 0; i < present.length; i++) {
+        for (let j = i + 1; j < present.length; j++) {
+          const nA = present[i], nB = present[j];
+          const alA = teamAl[nA], alB = teamAl[nB];
+          if (!alA || !alB || alA.color === alB.color) continue;
+          const k = pairKey(nA, nB);
+          const rec = pairs[k];
+          const sA = alA.score, sB = alB.score;
+          const aIsFirst = rec.numA === nA;
+          if (sA > sB) { aIsFirst ? rec.wA++ : rec.wB++; }
+          else if (sA < sB) { aIsFirst ? rec.wB++ : rec.wA++; }
+          else { rec.ties++; }
+        }
+      }
+    }
+
+    const redAl  = alliances.find(a => a.color === 'red');
+    const blueAl = alliances.find(a => a.color === 'blue');
+    const scoreStr = scored
+      ? `<span class="h2h-score-red">${redAl?.score ?? '?'}</span>–<span class="h2h-score-blue">${blueAl?.score ?? '?'}</span>`
+      : '—';
+
+    return `<tr>
+      <td class="h2h-event-cell">${esc(m.event?.name || '—')}</td>
+      <td class="h2h-match-cell">${esc(ROUND_NAMES[m.round] || 'Round')} ${m.round === 2 ? m.matchnum : ''}</td>
+      <td class="h2h-score-cell">${scoreStr}</td>
+      ${teamCells.join('')}
+    </tr>`;
+  }).join('');
+
+  // Pairwise rivalry cards
+  const pairCards = Object.values(pairs).map(p => {
+    const total = p.wA + p.wB + p.ties;
+    if (!total) return '';
+    const pA = (p.wA / total * 100).toFixed(1);
+    const pT = (p.ties / total * 100).toFixed(1);
+    const pB = (p.wB / total * 100).toFixed(1);
+    return `
+      <div class="h2h-pair-card">
+        <div class="h2h-pair-header">
+          <span class="h2h-pair-num">${esc(p.numA)}</span>
+          <span class="h2h-pair-sep">vs</span>
+          <span class="h2h-pair-num">${esc(p.numB)}</span>
+        </div>
+        <div class="h2h-bar-wrap">
+          <span class="h2h-bar-label">${p.wA}W</span>
+          <div class="h2h-bar">
+            <div class="h2h-bar-a" style="width:${pA}%"></div>
+            <div class="h2h-bar-t" style="width:${pT}%"></div>
+            <div class="h2h-bar-b" style="width:${pB}%"></div>
+          </div>
+          <span class="h2h-bar-label">${p.wB}W</span>
+        </div>
+        <div class="h2h-pair-sub">${p.ties ? p.ties + 'T · ' : ''}${total} match${total > 1 ? 'es' : ''}</div>
+      </div>`;
+  }).filter(Boolean).join('');
+
+  return `
+    <div class="stats-section">
+      <div class="section-title">${title}</div>
+      ${pairCards ? `<div class="h2h-pair-grid">${pairCards}</div>` : ''}
+      <div class="table-wrap"><table class="h2h-table">
+        <thead><tr>
+          <th>Event</th><th>Match</th><th>Score</th>
+          ${nums.map(n => `<th>${esc(n)}</th>`).join('')}
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div class="h2h-legend">● red/blue = alliance &nbsp;·&nbsp; W/L/T = outcome &nbsp;·&nbsp; — = not in match</div>
+    </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIVE SCORES VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+
+let liveState = {
+  timer: null,         // setInterval handle
+  seenMatchIds: new Set(),
+  programId: 1,
+  feed: [],            // { evName, evId, match, ts }
+};
+
+async function openLiveView() {
+  showView('view-live');
+  renderLiveControls();
+  await refreshLiveFeed(true);
+  // Start polling every 60s; clear any prior interval
+  if (liveState.timer) clearInterval(liveState.timer);
+  liveState.timer = setInterval(() => refreshLiveFeed(false), 60000);
+}
+
+function renderLiveControls() {
+  const el = document.getElementById('live-controls');
+  if (!el) return;
+  el.innerHTML = `
+    <div class="live-controls-row">
+      <select id="live-prog-select" class="season-select">
+        <option value="1">V5RC (VRC)</option>
+        <option value="41">VIQRC</option>
+        <option value="4">VEXU</option>
+      </select>
+      <button class="btn-secondary" id="live-refresh-btn">↻ Refresh now</button>
+      <span class="live-pulse" id="live-pulse"></span>
+    </div>`;
+  const sel = el.querySelector('#live-prog-select');
+  sel.value = String(liveState.programId);
+  sel.addEventListener('change', async () => {
+    liveState.programId = +sel.value;
+    liveState.seenMatchIds = new Set();
+    liveState.feed = [];
+    await refreshLiveFeed(true);
+  });
+  el.querySelector('#live-refresh-btn').addEventListener('click', () => refreshLiveFeed(false));
+}
+
+async function refreshLiveFeed(initial) {
+  const feedEl = document.getElementById('live-feed');
+  const pulse  = document.getElementById('live-pulse');
+  if (!feedEl) return;
+
+  if (initial) {
+    setStatus('live', 'Finding ongoing events…');
+    feedEl.innerHTML = '';
+  }
+  if (pulse) { pulse.textContent = 'Refreshing…'; pulse.classList.add('active'); }
+
+  try {
+    const pid = liveState.programId;
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10);
+
+    // Fetch events happening today (start <= today <= end)
+    const evData = await apiFetch(
+      `/events?program[]=${pid}&start=${dateStr}&end=${dateStr}&per_page=250&page=1`
+    );
+    const events = evData.data || [];
+
+    if (initial && !events.length) {
+      clearStatus('live');
+      feedEl.innerHTML = '<p class="empty">No events found happening today. Try a different program.</p>';
+      if (pulse) { pulse.textContent = ''; pulse.classList.remove('active'); }
+      return;
+    }
+
+    // For each event fetch recent matches (capped at 3 concurrent to avoid rate-limit)
+    const newMatches = [];
+    const tasks = events.map(ev => async () => {
+      try {
+        const divs = await apiFetch(`/events/${ev.id}/divisions?per_page=10`);
+        const divList = divs.data || [];
+        for (const div of divList) {
+          const mData = await apiFetch(`/events/${ev.id}/divisions/${div.id}/matches?per_page=50&page=1`);
+          for (const m of (mData.data || [])) {
+            if (!matchIsScored(m)) continue;
+            if (liveState.seenMatchIds.has(m.id)) continue;
+            liveState.seenMatchIds.add(m.id);
+            newMatches.push({ evName: ev.name, evId: ev.id, evSku: ev.sku, match: m, ts: Date.now() });
+          }
+        }
+      } catch (_) {}
+    });
+    await promisePool(tasks, 3);
+
+    if (newMatches.length) {
+      // Newest first within each batch
+      newMatches.sort((a, b) => (b.match.matchnum - a.match.matchnum));
+      liveState.feed = [...newMatches, ...liveState.feed].slice(0, 200);
+    }
+
+    clearStatus('live');
+    renderLiveFeed(feedEl, events.length, initial && !liveState.feed.length);
+
+  } catch (err) {
+    setStatus('live', `Error: ${err.message}`, 'error');
+  }
+
+  if (pulse) {
+    pulse.textContent = 'Updated ' + new Date().toLocaleTimeString();
+    pulse.classList.remove('active');
+  }
+}
+
+function renderLiveFeed(feedEl, eventCount, noData) {
+  if (noData || !liveState.feed.length) {
+    feedEl.innerHTML = `<p class="empty">No scored matches found yet across ${eventCount} event(s) today. Checking again in 60s.</p>`;
+    return;
+  }
+
+  // Group by event
+  const byEvent = {};
+  for (const entry of liveState.feed) {
+    if (!byEvent[entry.evId]) byEvent[entry.evId] = { name: entry.evName, sku: entry.evSku, id: entry.evId, matches: [] };
+    byEvent[entry.evId].matches.push(entry);
+  }
+
+  feedEl.innerHTML = Object.values(byEvent).map(ev => {
+    const rows = ev.matches.map(entry => {
+      const m = entry.match;
+      const alliances = m.alliances || [];
+      const red  = alliances.find(a => a.color === 'red');
+      const blue = alliances.find(a => a.color === 'blue');
+      const redTeams  = (red?.teams  || []).map(t => t.team?.name).filter(Boolean).join(' / ');
+      const blueTeams = (blue?.teams || []).map(t => t.team?.name).filter(Boolean).join(' / ');
+      const redWon  = red?.score  > blue?.score;
+      const blueWon = blue?.score > red?.score;
+      const roundLabel = ROUND_NAMES[m.round] || 'Match';
+      const matchLabel = m.round === 2 ? `Q${m.matchnum}` : roundLabel;
+      return `<tr class="live-match-row">
+        <td class="live-match-label">${esc(matchLabel)}</td>
+        <td class="live-alliance live-red ${redWon ? 'live-winner' : ''}">
+          <span class="live-teams">${esc(redTeams)}</span>
+          <span class="live-score">${red?.score ?? '?'}</span>
+        </td>
+        <td class="live-vs">vs</td>
+        <td class="live-alliance live-blue ${blueWon ? 'live-winner' : ''}">
+          <span class="live-score">${blue?.score ?? '?'}</span>
+          <span class="live-teams">${esc(blueTeams)}</span>
+        </td>
+        <td class="live-age">${timeAgo(entry.ts)}</td>
+      </tr>`;
+    }).join('');
+
+    return `
+      <div class="live-event-block">
+        <div class="live-event-name">
+          <button class="live-event-link" data-eid="${ev.id}">${esc(ev.name)}</button>
+        </div>
+        <div class="table-wrap">
+          <table class="live-table">
+            <thead><tr>
+              <th>Match</th>
+              <th class="live-red-head">Red</th>
+              <th></th>
+              <th class="live-blue-head">Blue</th>
+              <th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Wire event links
+  feedEl.querySelectorAll('.live-event-link[data-eid]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        const evData = await apiFetch(`/events/${btn.dataset.eid}`);
+        const ev = evData.data?.[0] || evData;
+        if (ev?.id) openEventDetail(ev);
+      } catch (_) {}
+    });
+  });
+}
+
+// Stop polling when leaving the live view
+function stopLivePolling() {
+  if (liveState.timer) { clearInterval(liveState.timer); liveState.timer = null; }
 }

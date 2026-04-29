@@ -13,15 +13,21 @@
 <body>
   <header class="site-header">
     <span class="logo">idk scouting</span>
-    <label class="theme-switch-wrap" title="Toggle dark mode" aria-label="Toggle dark mode">
-      <span class="theme-icon">☀︎</span>
-      <span class="toggle-switch">
-        <input type="checkbox" id="theme-toggle" class="toggle-input" />
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </span>
-      <span class="theme-icon">◑</span>
-    </label>
+    <div class="header-right">
+      <button class="notif-bell-btn" id="notif-bell" title="Notifications &amp; Watchlist" aria-label="Notifications">
+        🔔<span class="notif-badge" id="notif-badge" style="display:none"></span>
+      </button>
+      <label class="theme-switch-wrap" title="Toggle dark mode" aria-label="Toggle dark mode">
+        <span class="theme-icon">☀︎</span>
+        <span class="toggle-switch">
+          <input type="checkbox" id="theme-toggle" class="toggle-input" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        </span>
+        <span class="theme-icon">◑</span>
+      </label>
+    </div>
   </header>
+  <div id="notif-panel" class="notif-panel hidden"></div>
 
   <main class="app-shell">
 
@@ -38,6 +44,7 @@
         <button class="tab" data-tab="standings">Standings</button>
         <button class="tab" data-tab="map" id="map-nav-btn">Explore Teams</button>
         <button class="tab" data-tab="compare">Compare Teams</button>
+        <button class="tab" data-tab="live">Live</button>
       </div>
 
       <!-- Team search panel -->
@@ -115,6 +122,18 @@
       <div id="compare-search-row"></div>
       <div id="compare-status" class="status hidden"></div>
       <div id="compare-content"></div>
+    </div>
+
+    <!-- ── Live Scores view ── -->
+    <div id="view-live" class="view hidden">
+      <button class="back-btn" id="back-from-live">← Back</button>
+      <div class="page-heading">
+        <h1>Live Scores</h1>
+        <p class="page-sub">Match results from ongoing events, refreshed every 60 seconds.</p>
+      </div>
+      <div id="live-controls"></div>
+      <div id="live-status" class="status hidden"></div>
+      <div id="live-feed"></div>
     </div>
 
     <!-- ── World Map view ── -->

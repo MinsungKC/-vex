@@ -649,6 +649,11 @@ tbody tr:hover td { background: var(--bg); }
   font-family: inherit; text-decoration: underline;
 }
 .award-winner-btn:hover { opacity: .75; }
+.award-winner-div {
+  font-size: .72rem; color: var(--text-muted);
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 6px; margin-left: 2px;
+}
 .award-person { font-size: .9rem; font-weight: 700; color: var(--accent); }
 
 .award-pred-section {
@@ -1334,4 +1339,31 @@ tbody tr:hover td { background: var(--bg); }
 /* Not-recorded badge for past event awards */
 .award-not-recorded {
   background: var(--bg); color: var(--text-muted); border: 1px solid var(--border);
+}
+
+/* ── Row highlight (rankings search / navigate-to) ── */
+@keyframes row-flash {
+  0%   { background: var(--accent); color: #fff; }
+  60%  { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--text); }
+  100% { background: transparent; }
+}
+.row-highlight {
+  animation: row-flash 2.5s ease-out forwards;
+}
+.row-highlight td { border-radius: 4px; }
+
+/* ── Standings team search ── */
+.st-search-wrap { display: flex; gap: 4px; align-items: center; }
+.st-search-input {
+  padding: 5px 10px; border-radius: 6px; font-size: .85rem;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  font-family: inherit; width: 120px; transition: border-color .15s;
+}
+.st-search-input:focus { outline: none; border-color: var(--accent); }
+
+/* ── Award history cache note ── */
+.award-cache-note { font-size: .75rem; color: var(--text-muted); margin-left: 8px; }
+.award-cache-bust {
+  background: none; border: none; color: var(--accent); font-size: .75rem;
+  cursor: pointer; font-family: inherit; padding: 0; text-decoration: underline;
 }

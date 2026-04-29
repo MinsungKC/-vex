@@ -30,7 +30,9 @@ let cachedEventRankings   = {}; // { teamName: { rank, wins, losses, ties, winRa
 let cachedEventSkills     = {}; // { teamName: { driver, prog, combined, normalized } }
 let cachedAwardsData      = []; // raw awards from /events/{id}/awards
 let cachedPriorAwardScores = null; // null = not loaded; {} = loaded (teamName → score)
+let cachedPriorExcellenceSet = null; // Set of team numbers who won Excellence at qualifying events
 let currentTeamAtEvent  = null;
+let pendingHighlightTeam = null; // team number to highlight after rankings load
 let predWeights         = JSON.parse(localStorage.getItem('predWeights') || 'null') || { opr: 50, ranking: 25, skills: 25 };
 let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions') || 'false');
 
@@ -125,7 +127,14 @@ document.getElementById('back-to-search').addEventListener('click', () => showVi
 document.getElementById('back-to-seasons').addEventListener('click', () => {
   if (currentTeam) openSeasonsView(currentTeam);
 });
-document.getElementById('back-to-event-from-team').addEventListener('click', () => showView('view-event'));
+document.getElementById('back-to-event-from-team').addEventListener('click', async () => {
+  pendingHighlightTeam = currentTeamAtEvent;
+  activeEventTab = 'rankings';
+  showView('view-event');
+  document.querySelectorAll('.detail-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === 'rankings'));
+  await loadEventTabContent();
+});
 document.getElementById('back-from-map').addEventListener('click', () => showView(mapState.sourceView));
 document.getElementById('back-from-standings').addEventListener('click', () => {
   showView('view-search');
@@ -312,6 +321,7 @@ async function openEventDetail(ev) {
   cachedEventSkills      = {};
   cachedAwardsData       = [];
   cachedPriorAwardScores = null;
+  cachedPriorExcellenceSet = null;
 
   showView('view-event');
   renderEventHero(ev);
@@ -358,6 +368,7 @@ function renderDivisionSelector(divisions) {
       cachedEventSkills      = {};
       cachedAwardsData       = [];
       cachedPriorAwardScores = null;
+      cachedPriorExcellenceSet = null;
       await loadEventTabContent();
     });
   });
@@ -450,6 +461,15 @@ function attachMatchTabListeners(el) {
     row.addEventListener('click', () => toggleMatchDetail(row));
   });
 
+  // Award history cache bust
+  el.querySelector('#award-cache-bust')?.addEventListener('click', () => {
+    const key = priorAwardsCacheKey(currentEvent?.program?.id, currentEvent?.season?.id);
+    localStorage.removeItem(key);
+    cachedPriorAwardScores = null;
+    cachedPriorExcellenceSet = null;
+    loadEventTabContent();
+  });
+
   // Sim tab controls
   let simN = 100;
   el.querySelectorAll('.sim-count-btn').forEach(btn => {
@@ -496,44 +516,89 @@ function attachMatchTabListeners(el) {
   }
 }
 
-// Fetch prior-season award history for a list of team names (by number string like "8838E").
-// Returns { teamName: rawScore } where rawScore is the sum of PRIOR_AWARD_WEIGHTS for each award
-// the team won at OTHER events this season.
-async function loadPriorAwardScores(teamNames) {
-  if (!teamNames.length || !currentEvent?.season?.id || !currentEvent?.program?.id) return {};
+const PRIOR_AWARDS_TTL = 12 * 60 * 60 * 1000; // 12 h — award results don't change after an event ends
+const priorAwardsCacheKey = (pid, sid) => `priorAwards-${pid}-${sid}`;
+
+// Fetches qualifying events for the season and reads each event's awards via
+// GET /events/{id}/awards. Results are cached in localStorage (12 h TTL) so
+// the hundreds of API calls only happen once per session.
+// Returns { teamName: avgWeightedScore } and populates cachedPriorExcellenceSet.
+async function loadPriorAwardData() {
+  if (!currentEvent?.season?.id || !currentEvent?.program?.id) return {};
   const seasonId  = currentEvent.season.id;
   const programId = currentEvent.program.id;
   const eventId   = currentEvent.id;
-  const scores    = {};
 
-  // Step 1: batch-resolve team numbers → IDs (20 numbers per request, sequential)
-  const nameToId = {};
-  for (let i = 0; i < teamNames.length; i += 20) {
-    const chunk = teamNames.slice(i, i + 20);
-    try {
-      const qs  = chunk.map(n => `number[]=${encodeURIComponent(n)}`).join('&');
-      const res = await apiFetch(`/teams?${qs}&program[]=${programId}&myTeams=false&per_page=250`);
-      for (const t of (res.data || [])) { if (t.number) nameToId[t.number] = t.id; }
-    } catch (_) {}
-    if (i + 20 < teamNames.length) await sleep(150);
-  }
+  // ── 1. Try localStorage cache first ────────────────────────────────────────
+  const cacheKey = priorAwardsCacheKey(programId, seasonId);
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+    if (cached && Date.now() - cached.ts < PRIOR_AWARDS_TTL) {
+      cachedPriorExcellenceSet = new Set(cached.excellence || []);
+      return cached.scores || {};
+    }
+  } catch (_) {}
 
-  // Step 2: fetch awards for each team, 3 at a time to stay under rate limits
-  const resolved = teamNames.filter(n => nameToId[n]);
-  await promisePool(resolved.map(name => async () => {
+  // ── 2. Fetch only past qualifying events (status=past cuts out future events) ─
+  const allEvents = await fetchAllPages(
+    `/events?season[]=${seasonId}&program[]=${programId}&status=past&per_page=250`
+  );
+  const qualEvents = allEvents.filter(e => {
+    if (e.id === eventId) return false;
+    const lvl = (e.level || '').toLowerCase();
+    const nm  = (e.name  || '').toLowerCase();
+    return !(lvl === 'world' || nm.includes('world championship') || nm.includes('vex worlds'));
+  });
+
+  const excellenceWinners = new Set();
+  const teamData = {}; // teamName → { totalWeight, eventsSeen: Set<eventId> }
+
+  // ── 3. Fetch GET /events/{id}/awards for each event (3 concurrent to avoid rate-limit) ─
+  await promisePool(qualEvents.map(ev => async () => {
     try {
-      const awardsList = await fetchAllPages(`/teams/${nameToId[name]}/awards?season[]=${seasonId}`);
-      let total = 0;
-      const eventsSeen = new Set();
-      for (const a of awardsList) {
-        if (a.event?.id === eventId) continue;
-        if (a.event?.id) eventsSeen.add(a.event.id);
-        total += PRIOR_AWARD_WEIGHTS[classifyAward(a.title)] || 0;
+      const awards = await fetchAllPages(`/events/${ev.id}/awards`);
+      for (const award of awards) {
+        const classified = classifyAward(award.title);
+        const weight = PRIOR_AWARD_WEIGHTS[classified] || 0;
+
+        // Winners come from two fields the API may return:
+        //   award.teams   → [{ team: { name }, division }]  (structured)
+        //   award.winners → ["8838E", "PersonName", ...]    (flat strings)
+        const names = new Set();
+        for (const t of (award.teams || [])) {
+          if (t.team?.name) names.add(t.team.name);
+        }
+        for (const w of (award.winners || [])) {
+          if (w && /^\d+[A-Za-z]?$/.test(w.trim())) names.add(w.trim());
+        }
+
+        for (const name of names) {
+          if (classified === 'excellence') excellenceWinners.add(name);
+          if (weight > 0) {
+            if (!teamData[name]) teamData[name] = { totalWeight: 0, eventsSeen: new Set() };
+            teamData[name].totalWeight += weight;
+            teamData[name].eventsSeen.add(ev.id);
+          }
+        }
       }
-      scores[name] = eventsSeen.size > 0 ? total / eventsSeen.size : 0;
     } catch (_) {}
   }), 3);
 
+  const scores = {};
+  for (const [name, d] of Object.entries(teamData)) {
+    scores[name] = d.eventsSeen.size > 0 ? d.totalWeight / d.eventsSeen.size : 0;
+  }
+
+  // ── 4. Persist to localStorage so repeated opens don't re-fetch ────────────
+  try {
+    localStorage.setItem(cacheKey, JSON.stringify({
+      ts:        Date.now(),
+      excellence: [...excellenceWinners],
+      scores,
+    }));
+  } catch (_) {} // ignore if storage is full
+
+  cachedPriorExcellenceSet = excellenceWinners;
   return scores;
 }
 
@@ -545,6 +610,18 @@ function isWorldsStyleEvent() {
   return level === 'world' ||
     name.includes('world championship') ||
     name.includes('vex worlds');
+}
+
+// True when the current division is the Dome/finale ceremony division at Worlds,
+// where Excellence, TC, and TF are awarded for the full event.
+function isDomeDivision() {
+  if (!isWorldsStyleEvent()) return false;
+  const divName = (currentEvent?.divisions?.find(d => d.id === activeDiv)?.name || '').toLowerCase();
+  return divName.includes('dome') || divName.includes('closing') ||
+    divName.includes('high school') || divName.includes('middle school') ||
+    divName.includes('hs') || divName.includes('ms') || divName.includes(' hs ') ||
+    divName.includes('excellence') || divName.includes('championship') ||
+    divName.includes('college');
 }
 
 async function loadEventTabContent() {
@@ -617,7 +694,7 @@ async function loadEventTabContent() {
         // Kick off prior-award history fetch in background; re-renders Excellence card when done
         if (cachedPriorAwardScores === null) {
           cachedPriorAwardScores = {}; // mark as in-progress to prevent re-entry
-          loadPriorAwardScores(awardsTop40Eligible()).then(scores => {
+          loadPriorAwardData().then(scores => {
             cachedPriorAwardScores = scores;
             if (activeEventTab === 'awards') {
               el.innerHTML = renderEventAwards(cachedAwardsData);
@@ -651,6 +728,20 @@ async function loadEventTabContent() {
 
     attachMatchTabListeners(el);
 
+    // Highlight a specific team after rankings load (e.g. navigating from team stats page)
+    if (pendingHighlightTeam && activeEventTab === 'rankings') {
+      const teamNum = pendingHighlightTeam;
+      pendingHighlightTeam = null;
+      requestAnimationFrame(() => {
+        const row = el.querySelector(`tr[data-num="${CSS.escape(teamNum)}"]`);
+        if (row) {
+          row.classList.add('row-highlight');
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => row.classList.remove('row-highlight'), 2500);
+        }
+      });
+    }
+
   } catch (err) {
     setStatus('event-tab', `Error: ${err.message}`, 'error');
   }
@@ -667,7 +758,7 @@ function renderEventRankings(rankings) {
       r.ap != null ? `AP ${r.ap}` : '',
       r.sp != null ? `SP ${r.sp}` : '',
     ].filter(Boolean).join(' · ');
-    return `<tr>
+    return `<tr data-num="${esc(r.team?.name)}">
       <td><span class="rank-badge ${cls}">#${r.rank}</span></td>
       <td><button class="team-link" data-num="${esc(r.team?.name)}">${esc(r.team?.name)}</button></td>
       <td>${r.wins ?? '—'}–${r.losses ?? '—'}–${r.ties ?? '—'}</td>
@@ -1533,6 +1624,7 @@ let standingsState = {
   region: '',
   data: null,         // processed team array for current program+season
   page: 0,
+  search: '',         // team number search query
 };
 const STANDINGS_PAGE = 100;
 
@@ -1840,6 +1932,11 @@ function renderStandingsFilters(data) {
       '<option value="">All Regions</option>' +
       regions.map(r => '<option value="' + esc(r) + '"' + (r === standingsState.region ? ' selected' : '') + '>' + esc(r) + '</option>').join('') +
       '</select>' : '<select class="map-filter-select" id="st-region" style="display:none"><option value=""></option></select>') +
+    // Team search
+    '<div class="st-search-wrap">' +
+    '<input id="st-search" type="text" class="st-search-input" placeholder="Find team…" autocomplete="off" value="' + esc(standingsState.search) + '" />' +
+    '<button class="map-toggle-btn" id="st-search-btn">Find</button>' +
+    '</div>' +
     // Cache info
     '<span class="st-cache-note" id="st-cache-note"></span>' +
     '<button class="map-toggle-btn" id="st-refresh" title="Force refresh from API">Refresh</button>' +
@@ -1884,6 +1981,45 @@ function renderStandingsFilters(data) {
     standingsState.data = null;
     loadStandingsData();
   });
+
+  function doStandingsSearch() {
+    const query = (document.getElementById('st-search')?.value || '').trim().toUpperCase();
+    standingsState.search = query;
+    if (!query || !standingsState.data) return;
+    const filtered = applyStandingsFilters(standingsState.data);
+    const idx = filtered.findIndex(t => t.number?.toUpperCase() === query);
+    if (idx === -1) {
+      // Try partial match
+      const partialIdx = filtered.findIndex(t => t.number?.toUpperCase().includes(query));
+      if (partialIdx === -1) return;
+      scrollToStandingsRow(filtered, partialIdx);
+    } else {
+      scrollToStandingsRow(filtered, idx);
+    }
+  }
+
+  function scrollToStandingsRow(filtered, idx) {
+    const neededPage = Math.floor(idx / STANDINGS_PAGE);
+    if (standingsState.page < neededPage) {
+      standingsState.page = neededPage;
+      renderStandingsTable(filtered);
+    }
+    requestAnimationFrame(() => {
+      const teamNum = filtered[idx]?.number;
+      if (!teamNum) return;
+      const row = document.querySelector(`#standings-content tr[data-st-num="${CSS.escape(teamNum)}"]`);
+      if (row) {
+        row.classList.add('row-highlight');
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => row.classList.remove('row-highlight'), 2500);
+      }
+    });
+  }
+
+  document.getElementById('st-search-btn').addEventListener('click', doStandingsSearch);
+  document.getElementById('st-search')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') doStandingsSearch();
+  });
 }
 
 function renderStandingsTable(filtered) {
@@ -1908,7 +2044,7 @@ function renderStandingsTable(filtered) {
     const globalRank = i + 1;
     const loc = [t.city, t.region, t.country].filter(Boolean).join(', ') || '—';
     rows +=
-      '<tr>' +
+      '<tr data-st-num="' + esc(t.number) + '">' +
       '<td class="st-rank">' + globalRank + '</td>' +
       '<td><button class="team-link" data-num="' + esc(t.number) + '">' + esc(t.number) + '</button></td>' +
       '<td class="td-score-muted" style="font-size:.8rem">' + esc(t.grade || '—') + '</td>' +
@@ -2330,9 +2466,12 @@ async function loadSkillsHeatmap() {
 
     if (!coords) continue;
 
-    // Weight = normalized score; gives brighter spots to higher-scoring teams
+    // Small jitter so multiple teams in the same region spread into a visible
+    // cluster rather than stacking on a single pixel (±1° ≈ ±110 km)
+    const lat = coords[0] + (Math.random() - 0.5) * 2;
+    const lon = coords[1] + (Math.random() - 0.5) * 2;
     const weight = t.combined / maxScore;
-    pts.push([coords[0], coords[1], weight]);
+    pts.push([lat, lon, weight]);
   }
 
   if (!pts.length) return;
@@ -2819,45 +2958,113 @@ function gaussianElim(A, b, n) {
 }
 
 // ── Award classification ────────────────────────────────────────────────────
+// criteria values:
+//   'top40'      — top 40% qual rank + top 40% combined skills + programming skills > 0 (Excellence)
+//   'qual_rank'  — determined by elimination bracket result (Tournament Champions/Finalists)
+//   'skills'     — highest combined robot skills score
+//   'auto_gt0'   — must have programming skills score > 0; otherwise judged (Think Award)
+//   'skills_rank'— strong combined skills + qual rank (Amaze / Innovate qualifier)
+//   'notebook'   — fully judged: any team eligible regardless of performance
+//   'none'       — purely discretionary / behavioral
 const AWARD_INFO = {
-  excellence:    { icon: '🏆', cat: 'excellence',  criteria: 'top40',      desc: 'Top 40% in qual rankings, combined skills, and autonomous skills (> 0 required)' },
-  champion:      { icon: '🥇', cat: 'performance', criteria: 'qual_rank',  desc: 'Best record in qualification matches' },
-  finalist:      { icon: '🥈', cat: 'performance', criteria: 'qual_rank2', desc: 'Second-best record in qualification matches' },
-  skills_champ:  { icon: '⚙️', cat: 'performance', criteria: 'skills',     desc: 'Highest combined Driver + Programming Skills score' },
-  skills_2nd:    { icon: '🎖️', cat: 'performance', criteria: 'skills',     desc: 'Second-highest combined Skills score' },
-  high_score:    { icon: '📈', cat: 'performance', criteria: 'match_score',desc: 'Highest single-match alliance score' },
-  design:        { icon: '📐', cat: 'notebook',    criteria: 'notebook',   desc: 'Outstanding Engineering Notebook and design process — fully judged' },
-  innovate:      { icon: '💡', cat: 'notebook',    criteria: 'notebook',   desc: 'Novel design or strategy, well-documented in notebook — fully judged' },
-  think:         { icon: '🧠', cat: 'notebook',    criteria: 'auto_gt0',   desc: 'Outstanding programming — must have Autonomous Skills score > 0' },
-  amaze:         { icon: '✨', cat: 'notebook',    criteria: 'skills_rank', desc: 'Consistently high-performing robot across quals and skills challenges' },
-  build:         { icon: '🔧', cat: 'notebook',    criteria: 'notebook',   desc: 'Exceptional robot construction and mechanical craftsmanship — fully judged' },
-  create:        { icon: '🎨', cat: 'notebook',    criteria: 'notebook',   desc: 'Creative engineering solutions to game challenges — fully judged' },
-  judges:        { icon: '⚖️', cat: 'special',     criteria: 'none',       desc: 'Judges\' discretionary award for exceptional qualities' },
-  inspire:       { icon: '🌟', cat: 'conduct',     criteria: 'none',       desc: 'Passion, positivity, and integrity throughout the event' },
-  sportsmanship: { icon: '🤝', cat: 'conduct',     criteria: 'top40',      desc: 'Exemplary sportsmanship — top 40% in qual rankings and skills' },
-  energy:        { icon: '⚡', cat: 'conduct',     criteria: 'none',       desc: 'Outstanding enthusiasm and excitement at the event' },
-  other:         { icon: '🏅', cat: 'other',       criteria: 'none',       desc: '' },
+  excellence:    { icon: '🏆', cat: 'excellence',  criteria: 'top40',
+    desc: 'Top 40% qual rank · top 40% combined skills · programming skills > 0 required · judged' },
+  champion:      { icon: '🥇', cat: 'performance', criteria: 'qual_rank',
+    desc: 'Won the elimination finals' },
+  finalist:      { icon: '🥈', cat: 'performance', criteria: 'qual_rank',
+    desc: 'Runner-up in the elimination finals' },
+  skills_champ:  { icon: '⚙️', cat: 'performance', criteria: 'skills',
+    desc: 'Highest combined Driver + Programming Skills score at this event' },
+  skills_2nd:    { icon: '🎖️', cat: 'performance', criteria: 'skills',
+    desc: 'Second-highest combined Skills score' },
+  high_score:    { icon: '📈', cat: 'performance', criteria: 'qual_rank',
+    desc: 'Highest single-match alliance score recorded at this event' },
+  design:        { icon: '📐', cat: 'notebook',    criteria: 'notebook',
+    desc: 'Outstanding engineering design process — judged on notebook + interview · any team eligible' },
+  innovate:      { icon: '💡', cat: 'notebook',    criteria: 'notebook',
+    desc: 'Novel or innovative robot design — judged · any team eligible' },
+  think:         { icon: '🧠', cat: 'notebook',    criteria: 'auto_gt0',
+    desc: 'Outstanding autonomous programming — must have programming skills score > 0 · judged' },
+  amaze:         { icon: '✨', cat: 'notebook',    criteria: 'skills_rank',
+    desc: 'Excellent performance across skills challenges and qual matches · judged' },
+  build:         { icon: '🔧', cat: 'notebook',    criteria: 'notebook',
+    desc: 'Exceptional robot construction quality — judged · any team eligible' },
+  create:        { icon: '🎨', cat: 'notebook',    criteria: 'notebook',
+    desc: 'Creative solution to the game challenge — judged · any team eligible' },
+  judges:        { icon: '⚖️', cat: 'special',     criteria: 'none',
+    desc: 'Special recognition at judges\' discretion — any team eligible' },
+  inspire:       { icon: '🌟', cat: 'conduct',     criteria: 'none',
+    desc: 'Ambassador for VEX — passion, positivity, and community engagement · any team eligible' },
+  sportsmanship: { icon: '🤝', cat: 'conduct',     criteria: 'none',
+    desc: 'Exemplary gracious professionalism throughout the event · any team eligible' },
+  energy:        { icon: '⚡', cat: 'conduct',     criteria: 'none',
+    desc: 'Outstanding enthusiasm and team spirit · any team eligible' },
+  other:         { icon: '🏅', cat: 'other',       criteria: 'none', desc: '' },
 };
 
 function classifyAward(title) {
   const t = (title || '').toLowerCase();
-  if (t.includes('excellence'))                                         return 'excellence';
-  if (t.includes('tournament champion') || t.includes('division champion') || t.includes('teamwork champion')) return 'champion';
-  if (t.includes('robot skills champion') || (t.includes('skills') && t.includes('champion'))) return 'skills_champ';
-  if (t.includes('finalist') || (t.includes('second place') && !t.includes('skills')))         return 'finalist';
-  if (t.includes('skills') && t.includes('second'))                    return 'skills_2nd';
-  if (t.includes('high score') || t.includes('highest score'))         return 'high_score';
-  if (t.includes('design'))                                             return 'design';
-  if (t.includes('innovate'))                                           return 'innovate';
-  if (t.includes('think'))                                              return 'think';
-  if (t.includes('amaze'))                                              return 'amaze';
-  if (t.includes('build'))                                              return 'build';
-  if (t.includes('create'))                                             return 'create';
-  if (t.includes('judge'))                                              return 'judges';
-  if (t.includes('inspire'))                                            return 'inspire';
-  if (t.includes('sportsmanship'))                                      return 'sportsmanship';
-  if (t.includes('energy'))                                             return 'energy';
+  if (t.includes('excellence'))                                                           return 'excellence';
+  if (t.includes('tournament champion') || t.includes('division champion') ||
+      t.includes('teamwork champion')   || t.includes('teamwork challenge champion'))    return 'champion';
+  if (t.includes('robot skills champion') || t.includes('skills challenge champion') ||
+      (t.includes('skills') && t.includes('champion')))                                 return 'skills_champ';
+  if (t.includes('finalist') || (t.includes('second place') && !t.includes('skills'))) return 'finalist';
+  if (t.includes('skills') && (t.includes('2nd') || t.includes('second')))             return 'skills_2nd';
+  if (t.includes('high score') || t.includes('highest score'))                          return 'high_score';
+  if (t.includes('design'))                                                              return 'design';
+  if (t.includes('innovate') || t.includes('innovation'))                               return 'innovate';
+  if (t.includes('think'))                                                               return 'think';
+  if (t.includes('amaze'))                                                               return 'amaze';
+  if (t.includes('build'))                                                               return 'build';
+  if (t.includes('create') || t.includes('creative'))                                   return 'create';
+  if (t.includes('judge') || t.includes("judges'") || t.includes("judge's"))           return 'judges';
+  if (t.includes('inspire') || t.includes('inspiration'))                               return 'inspire';
+  if (t.includes('sportsmanship') || t.includes('spirit'))                              return 'sportsmanship';
+  if (t.includes('energy') || t.includes('enthusiasm'))                                 return 'energy';
   return 'other';
+}
+
+// Extract all winners from an award object, handling every format the API returns:
+//   a.teams   = [{ team: { id, name, number }, division: { id, name } }]  — structured
+//   a.winners = ["8838E", "Volunteer Name"]                               — flat strings
+function extractAwardWinners(a) {
+  if (!a) return [];
+  const results = [];
+  const seen = new Set();
+
+  for (const t of (a.teams || [])) {
+    // Nested format: { team: { name }, division }
+    const teamName = t.team?.name || t.team?.number;
+    if (teamName && !seen.has(teamName)) {
+      seen.add(teamName);
+      results.push({ kind: 'team', name: teamName, division: t.division?.name || null });
+    }
+    // Direct format: team object IS the winner (no nesting)
+    else if (!t.team && (t.name || t.number) && !seen.has(t.name || t.number)) {
+      const n = t.name || t.number;
+      seen.add(n);
+      results.push({ kind: 'team', name: n, division: null });
+    }
+    // Person winner embedded in team slot
+    if (t.person && !seen.has(t.person)) {
+      seen.add(t.person);
+      results.push({ kind: 'person', name: t.person });
+    }
+  }
+
+  for (const w of (a.winners || [])) {
+    if (!w || seen.has(w)) continue;
+    seen.add(w);
+    // Team number: one or more digits, optionally followed by a single letter (8838E, 1234, 99999X)
+    if (/^\d+[A-Za-z]?$/.test(w.trim())) {
+      results.push({ kind: 'team', name: w.trim(), division: null });
+    } else {
+      results.push({ kind: 'person', name: w });
+    }
+  }
+
+  return results;
 }
 
 // ── Award eligibility / prediction helpers ─────────────────────────────────
@@ -2938,246 +3145,279 @@ function compositeAwardScore(name) {
 
 // ── Event Awards ───────────────────────────────────────────────────────────
 function renderEventAwards(awards) {
-  const hasRankings = Object.keys(cachedEventRankings).length > 0;
-  const hasSkills   = Object.keys(cachedEventSkills).length > 0;
+  const hasRankings  = Object.keys(cachedEventRankings).length > 0;
+  const hasSkills    = Object.keys(cachedEventSkills).length > 0;
+  const pastEvent    = currentEvent?.end ? new Date(currentEvent.end) < new Date() : false;
+  const worldsQual   = isWorldsStyleEvent() && !isDomeDivision();
+  const worldsDome   = isWorldsStyleEvent() && isDomeDivision();
+  const DOME_ONLY    = new Set(['champion', 'finalist', 'excellence']);
 
-  // Sort API awards by order field
-  const apiAwards = [...awards].sort((a, b) => (a.order || 0) - (b.order || 0));
+  // ── Prior-award loading state ──────────────────────────────────────────────
+  const priorLoading = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length === 0;
+  const priorReady   = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length > 0;
+  const priorPending = cachedPriorAwardScores === null;
 
-  function renderAwardCard(type, a /* may be null if no API data yet */) {
-    const info    = AWARD_INFO[type] || AWARD_INFO.other;
-    const title   = a?.title || info.icon + ' ' + type;
-    const given   = a && (a.teams || []).length > 0;
-    const eventEnded = currentEvent?.end ? new Date(currentEvent.end) < new Date() : false;
-    const quals   = a?.qualifications?.length
-      ? `<div class="award-qual-tag">Qualifies: ${esc(a.qualifications.join(', '))}</div>` : '';
-
-    // Winner block (when award has been given)
-    let winnerHtml = '';
-    if (given) {
-      const winnerBtns = (a.teams || []).map(t => {
-        if (t.team?.name) return `<button class="team-link award-winner-btn" data-num="${esc(t.team.name)}">${esc(t.team.name)}</button>`;
-        if (t.person)     return `<span class="award-person">${esc(t.person)}</span>`;
-        return '';
-      }).filter(Boolean).join('');
-      winnerHtml = `<div class="award-winner-row"><span class="award-winner-label">Winner</span>${winnerBtns}</div>`;
-    }
-
-    // Prediction / eligible teams block
-    let predHtml = '';
-    if (!given) {
-      if (info.criteria === 'top40' && hasRankings && hasSkills) {
-        // At VEX Worlds, Excellence is announced at the Dome ceremony for the entire event,
-        // not per division. Show a banner and use this division's data as an indicator only.
-        const worldsBanner = isWorldsStyleEvent()
-          ? `<div class="award-pred-note-block award-worlds-note">
-               <strong>VEX Worlds:</strong> The Excellence Award is announced at the Dome closing ceremony for the full event — not per division. This table reflects divisional performance and is for reference only.
-             </div>`
-          : '';
-        const eligible = awardsTop40Eligible();
-        if (eligible.length) {
-          const ranked = eligible
-            .map(name => ({ name, score: compositeAwardScore(name) }))
-            .sort((a, b) => b.score - a.score);
-
-          // Prior award loading states
-          const priorLoading  = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length === 0;
-          const priorReady    = cachedPriorAwardScores !== null && Object.keys(cachedPriorAwardScores).length > 0;
-          const priorFetching = cachedPriorAwardScores === null; // null means in-progress (set to {} immediately)
-
-          const priorNote = priorFetching || priorLoading
-            ? `<span class="award-prior-loading">⏳ Loading prior award history…</span>`
-            : priorReady
-            ? `<span class="award-prior-ready">✓ Prior award history included</span>`
-            : '';
-
-          const showPriorCol = priorReady;
-
-          const rows = ranked.map((e, i) => {
-            const r        = cachedEventRankings[e.name];
-            const sk       = cachedEventSkills[e.name];
-            const pct      = Math.round(e.score * 100);
-            const priorRaw = cachedPriorAwardScores?.[e.name] ?? null;
-            const priorCell = showPriorCol
-              ? `<td class="aw-stat aw-prior">${priorRaw ? priorRaw.toFixed(1) : '—'}</td>`
-              : '';
-            return `<tr>
-              <td class="aw-rank">${i + 1}</td>
-              <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
-              <td class="aw-stat">Q${r?.rank ?? '—'}</td>
-              <td class="aw-stat">${sk ? (sk.driver + sk.prog) : '—'}</td>
-              <td class="aw-stat">${sk?.prog ?? '—'}</td>
-              ${priorCell}
-              <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${pct}%"></div><span>${pct}%</span></td>
-            </tr>`;
-          }).join('');
-
-          const priorHead = showPriorCol ? '<th title="Avg judged award weight per event this season">Prior/Evt</th>' : '';
-          const weightNote = showPriorCol
-            ? '35% qual · 30% skills · 20% auto · 15% award history'
-            : '40% qual · 35% skills · 25% auto';
-
-          predHtml = `
-            ${worldsBanner}
-            <div class="award-pred-section">
-              <div class="award-pred-title">
-                Eligible teams <span class="award-pred-note">(top 40% qual + skills + auto · ${weightNote})</span>
-                ${priorNote}
-              </div>
-              <div class="table-wrap"><table class="award-table">
-                <thead><tr><th>#</th><th>Team</th><th>Qual</th><th>Skills</th><th>Auto</th>${priorHead}<th>Score</th></tr></thead>
-                <tbody>${rows}</tbody>
-              </table></div>
-            </div>`;
-        } else if (hasRankings || hasSkills) {
-          predHtml = worldsBanner + `<div class="award-pred-note-block">Eligibility check: no teams currently meet top-40% threshold in all three categories.</div>`;
-        } else {
-          predHtml = worldsBanner + `<div class="award-pred-note-block">Eligibility data loads once rankings and skills are available.</div>`;
-        }
-      } else if (info.criteria === 'qual_rank' && hasRankings) {
-        const top3 = Object.entries(cachedEventRankings)
-          .sort(([, a], [, b]) => a.rank - b.rank).slice(0, 5);
-        const rows = top3.map(([name, r]) => `<tr>
-          <td class="aw-rank">${r.rank}</td>
-          <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
-          <td class="aw-stat">${r.wins}–${r.losses}–${r.ties}</td>
-          <td class="aw-stat">WP ${r.wp}</td>
-        </tr>`).join('');
-        predHtml = `<div class="award-pred-section">
-          <div class="award-pred-title">Current qual standings</div>
-          <div class="table-wrap"><table class="award-table">
-            <thead><tr><th>Rank</th><th>Team</th><th>W-L-T</th><th>WP</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table></div>
-        </div>`;
-      } else if (info.criteria === 'skills' && hasSkills) {
-        const top5 = Object.entries(cachedEventSkills)
-          .sort(([, a], [, b]) => (b.driver + b.prog) - (a.driver + a.prog)).slice(0, 5);
-        const rows = top5.map(([name, sk], i) => `<tr>
-          <td class="aw-rank">#${i + 1}</td>
-          <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
-          <td class="aw-stat">${sk.driver}</td>
-          <td class="aw-stat">${sk.prog}</td>
-          <td class="aw-stat" style="font-weight:700">${sk.driver + sk.prog}</td>
-        </tr>`).join('');
-        predHtml = `<div class="award-pred-section">
-          <div class="award-pred-title">Current skills standings</div>
-          <div class="table-wrap"><table class="award-table">
-            <thead><tr><th>#</th><th>Team</th><th>Driver</th><th>Auto</th><th>Total</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table></div>
-        </div>`;
-      } else if (info.criteria === 'auto_gt0' && hasSkills) {
-        const eligible = Object.entries(cachedEventSkills)
-          .filter(([, sk]) => (sk.prog || 0) > 0)
-          .sort(([, a], [, b]) => b.prog - a.prog).slice(0, 8);
-        if (eligible.length) {
-          const rows = eligible.map(([name, sk], i) => `<tr>
-            <td class="aw-rank">#${i + 1}</td>
-            <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
-            <td class="aw-stat" style="font-weight:700">${sk.prog}</td>
-          </tr>`).join('');
-          predHtml = `<div class="award-pred-section">
-            <div class="award-pred-title">Teams with Auto score > 0 (${eligible.length} eligible)</div>
-            <div class="table-wrap"><table class="award-table">
-              <thead><tr><th>#</th><th>Team</th><th>Auto Score</th></tr></thead>
-              <tbody>${rows}</tbody>
-            </table></div>
-          </div>`;
-        } else {
-          predHtml = `<div class="award-pred-note-block">No teams have an Autonomous Skills score yet.</div>`;
-        }
-      } else if (info.criteria === 'skills_rank' && hasSkills) {
-        // Amaze: skills + qual combined
-        const allNames = [...new Set([
-          ...Object.keys(cachedEventSkills),
-          ...Object.keys(cachedEventRankings),
-        ])];
-        const scored = allNames
-          .map(name => {
-            const sk = cachedEventSkills[name];
-            const r  = cachedEventRankings[name];
-            const tot = Object.keys(cachedEventRankings).length;
-            const skPct  = sk?.normalized ?? 0;
-            const rnkPct = (r && tot > 1) ? (tot - r.rank) / (tot - 1) : 0;
-            return { name, score: skPct * 0.6 + rnkPct * 0.4, sk, r };
-          })
-          .sort((a, b) => b.score - a.score).slice(0, 8);
-        const rows = scored.map((e, i) => `<tr>
-          <td class="aw-rank">#${i + 1}</td>
-          <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
-          <td class="aw-stat">${e.sk ? (e.sk.driver + e.sk.prog) : '—'}</td>
-          <td class="aw-stat">${e.r ? 'Q' + e.r.rank : '—'}</td>
-          <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${Math.round(e.score*100)}%"></div><span>${Math.round(e.score*100)}%</span></td>
-        </tr>`).join('');
-        predHtml = `<div class="award-pred-section">
-          <div class="award-pred-title">Top performers (60% skills + 40% qual rank)</div>
-          <div class="table-wrap"><table class="award-table">
-            <thead><tr><th>#</th><th>Team</th><th>Skills</th><th>Qual</th><th>Score</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table></div>
-        </div>`;
-      } else if (info.criteria === 'notebook') {
-        predHtml = `<div class="award-pred-note-block">Winner selected by judges from Engineering Notebook review and team interview — no performance threshold required.</div>`;
-      } else if (info.criteria === 'none') {
-        predHtml = `<div class="award-pred-note-block">Discretionary — determined by judges or event staff observation.</div>`;
-      }
-    }
-
-    const catCls = `award-cat-${info.cat}`;
-    return `
-      <div class="award-card ${catCls}${given ? ' award-given' : ''}">
-        <div class="award-card-header">
-          <span class="award-icon">${info.icon}</span>
-          <div class="award-card-title-block">
-            <div class="award-card-name">${esc(a?.title || title)}</div>
-            <div class="award-card-desc">${info.desc}</div>
-          </div>
-          ${given ? '<span class="award-given-badge">Awarded</span>' : eventEnded ? '<span class="award-pending-badge award-not-recorded">Not Recorded</span>' : '<span class="award-pending-badge">Pending</span>'}
-        </div>
-        ${quals}
-        ${winnerHtml}
-        ${predHtml}
+  // ── Prediction helpers ─────────────────────────────────────────────────────
+  function predExcellence() {
+    // Worlds Dome — show prior Excellence winners ranked by award score
+    if (worldsDome) {
+      const banner = `<div class="award-pred-note-block award-worlds-note">
+        <strong>VEX Worlds Dome:</strong> Excellence is awarded to a team from any division that won Excellence at a qualifying event this season.
       </div>`;
-  }
+      if (priorPending || priorLoading) {
+        return banner + `<div class="award-pred-note-block">⏳ Loading qualifying Excellence winners…</div>`;
+      }
+      if (!cachedPriorExcellenceSet?.size) {
+        return banner + `<div class="award-pred-note-block">No prior Excellence winners found in loaded event history.</div>`;
+      }
+      const rows = [...cachedPriorExcellenceSet]
+        .map(name => ({ name, score: cachedPriorAwardScores?.[name] ?? 0 }))
+        .sort((a, b) => b.score - a.score)
+        .map((e, i) => {
+          const sk = cachedEventSkills[e.name];
+          return `<tr>
+            <td class="aw-rank">${i + 1}</td>
+            <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
+            <td class="aw-stat">${sk ? sk.driver + sk.prog : '—'}</td>
+            <td class="aw-stat aw-prior">${e.score.toFixed(2)}</td>
+          </tr>`;
+        }).join('');
+      return banner + `<div class="award-pred-section">
+        <div class="award-pred-title">Prior Excellence winners <span class="award-pred-note">(${cachedPriorExcellenceSet.size} eligible · by award history score)</span>
+          <span class="award-prior-ready">✓ History loaded</span>
+        </div>
+        <div class="table-wrap"><table class="award-table">
+          <thead><tr><th>#</th><th>Team</th><th>Skills</th><th>Award Score</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>
+      </div>`;
+    }
 
-  // Build output: first render all API awards, then inject prediction context
-  let html = '';
+    // Standard event — top 40% qual + skills + auto > 0
+    if (!hasRankings || !hasSkills) return `<div class="award-pred-note-block">Loads once rankings and skills data are available.</div>`;
+    const eligible = awardsTop40Eligible();
+    if (!eligible.length) return `<div class="award-pred-note-block">No teams currently meet the top-40% threshold across qual rank, combined skills, and auto skills.</div>`;
 
-  // Sort by category priority then by API order
-  const CAT_PRIORITY = { excellence: 0, performance: 1, notebook: 2, special: 3, conduct: 4, other: 5 };
-  const sortedApiAwards = [...apiAwards].sort((a, b) => {
-    const ta = classifyAward(a.title), tb = classifyAward(b.title);
-    const ca = AWARD_INFO[ta]?.cat || 'other', cb = AWARD_INFO[tb]?.cat || 'other';
-    const pa = CAT_PRIORITY[ca] ?? 5, pb = CAT_PRIORITY[cb] ?? 5;
-    return pa !== pb ? pa - pb : (a.order || 0) - (b.order || 0);
-  });
+    const priorNote = priorPending || priorLoading
+      ? `<span class="award-prior-loading">⏳ Loading award history…</span>`
+      : priorReady ? `<span class="award-prior-ready">✓ Award history included</span>` : '';
 
-  if (!sortedApiAwards.length) {
-    // No awards data yet — show predictive cards for key award types
-    const previewTypes = ['excellence', 'champion', 'skills_champ', 'design', 'think', 'amaze', 'build', 'create', 'innovate', 'judges'];
-    html = previewTypes.map(type => renderAwardCard(type, null)).join('');
-    return `<div class="stats-section">
-      <div class="section-title">Awards</div>
-      <p class="sim-info">No awards have been announced yet — showing eligible teams based on current standings.</p>
-      <div class="awards-grid">${html}</div>
+    const rows = eligible
+      .map(name => ({ name, score: compositeAwardScore(name) }))
+      .sort((a, b) => b.score - a.score)
+      .map((e, i) => {
+        const r  = cachedEventRankings[e.name];
+        const sk = cachedEventSkills[e.name];
+        const priorRaw = priorReady ? (cachedPriorAwardScores?.[e.name] ?? null) : null;
+        return `<tr>
+          <td class="aw-rank">${i + 1}</td>
+          <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
+          <td class="aw-stat">Q${r?.rank ?? '—'}</td>
+          <td class="aw-stat">${sk ? sk.driver + sk.prog : '—'}</td>
+          <td class="aw-stat">${sk?.prog ?? '—'}</td>
+          ${priorReady ? `<td class="aw-stat aw-prior">${priorRaw != null ? priorRaw.toFixed(1) : '—'}</td>` : ''}
+          <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${Math.round(e.score*100)}%"></div><span>${Math.round(e.score*100)}%</span></td>
+        </tr>`;
+      }).join('');
+    const weightNote = priorReady ? '35% qual · 30% skills · 20% auto · 15% history' : '40% qual · 35% skills · 25% auto';
+    return `<div class="award-pred-section">
+      <div class="award-pred-title">Eligible teams <span class="award-pred-note">(${weightNote})</span> ${priorNote}</div>
+      <div class="table-wrap"><table class="award-table">
+        <thead><tr><th>#</th><th>Team</th><th>Qual</th><th>Skills</th><th>Auto</th>${priorReady ? '<th>History</th>' : ''}<th>Score</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
     </div>`;
   }
 
-  const pastEvent = currentEvent?.end ? new Date(currentEvent.end) < new Date() : false;
-  html = sortedApiAwards.map(a => renderAwardCard(classifyAward(a.title), a)).join('');
-  const givenCount = sortedApiAwards.filter(a => (a.teams || []).length > 0).length;
-  const pendingCount = sortedApiAwards.length - givenCount;
-  const statusNote = givenCount === sortedApiAwards.length
-    ? `All ${givenCount} award${givenCount !== 1 ? 's' : ''} have been announced.`
-    : pendingCount === sortedApiAwards.length
-    ? (pastEvent ? 'Award winners were not entered in RobotEvents for this event.' : 'No awards announced yet — showing eligible teams based on current standings.')
+  function predQualRank() {
+    if (!hasRankings) return `<div class="award-pred-note-block">Determined by elimination bracket result.</div>`;
+    const top = Object.entries(cachedEventRankings).sort(([,a],[,b]) => a.rank - b.rank).slice(0, 5);
+    const rows = top.map(([name, r]) => `<tr>
+      <td class="aw-rank">${r.rank}</td>
+      <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+      <td class="aw-stat">${r.wins}–${r.losses}–${r.ties}</td>
+      <td class="aw-stat">WP ${r.wp ?? '—'}</td>
+    </tr>`).join('');
+    return `<div class="award-pred-section"><div class="award-pred-title">Current qual standings (top 5)</div>
+      <div class="table-wrap"><table class="award-table">
+        <thead><tr><th>Rank</th><th>Team</th><th>W-L-T</th><th>WP</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+  }
+
+  function predSkills() {
+    if (!hasSkills) return `<div class="award-pred-note-block">Determined by highest combined skills score.</div>`;
+    const top = Object.entries(cachedEventSkills).sort(([,a],[,b]) => (b.driver+b.prog)-(a.driver+a.prog)).slice(0, 5);
+    const rows = top.map(([name, sk], i) => `<tr>
+      <td class="aw-rank">#${i+1}</td>
+      <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+      <td class="aw-stat">${sk.driver}</td><td class="aw-stat">${sk.prog}</td>
+      <td class="aw-stat" style="font-weight:700">${sk.driver+sk.prog}</td>
+    </tr>`).join('');
+    return `<div class="award-pred-section"><div class="award-pred-title">Current skills standings (top 5)</div>
+      <div class="table-wrap"><table class="award-table">
+        <thead><tr><th>#</th><th>Team</th><th>Driver</th><th>Auto</th><th>Combined</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+  }
+
+  function predAutoGt0() {
+    if (!hasSkills) return `<div class="award-pred-note-block">Requires programming skills score > 0 · otherwise fully judged.</div>`;
+    const eligible = Object.entries(cachedEventSkills).filter(([,sk]) => (sk.prog||0) > 0).sort(([,a],[,b]) => b.prog - a.prog).slice(0, 8);
+    if (!eligible.length) return `<div class="award-pred-note-block">No teams have a programming skills score yet.</div>`;
+    const rows = eligible.map(([name, sk], i) => `<tr>
+      <td class="aw-rank">#${i+1}</td>
+      <td><button class="team-link" data-num="${esc(name)}">${esc(name)}</button></td>
+      <td class="aw-stat" style="font-weight:700">${sk.prog}</td>
+    </tr>`).join('');
+    return `<div class="award-pred-section"><div class="award-pred-title">Teams with programming skills score > 0 (${eligible.length})</div>
+      <div class="table-wrap"><table class="award-table">
+        <thead><tr><th>#</th><th>Team</th><th>Auto Score</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+  }
+
+  function predSkillsRank() {
+    if (!hasSkills) return `<div class="award-pred-note-block">Based on combined skills + qual performance · judged.</div>`;
+    const names = [...new Set([...Object.keys(cachedEventSkills), ...Object.keys(cachedEventRankings)])];
+    const tot = Object.keys(cachedEventRankings).length;
+    const rows = names.map(name => {
+      const sk = cachedEventSkills[name]; const r = cachedEventRankings[name];
+      const skPct  = sk?.normalized ?? 0;
+      const rnkPct = (r && tot > 1) ? (tot - r.rank) / (tot - 1) : 0;
+      return { name, score: skPct * 0.6 + rnkPct * 0.4, sk, r };
+    }).sort((a,b) => b.score - a.score).slice(0, 8).map((e, i) => `<tr>
+      <td class="aw-rank">#${i+1}</td>
+      <td><button class="team-link" data-num="${esc(e.name)}">${esc(e.name)}</button></td>
+      <td class="aw-stat">${e.sk ? e.sk.driver + e.sk.prog : '—'}</td>
+      <td class="aw-stat">${e.r ? 'Q' + e.r.rank : '—'}</td>
+      <td class="aw-score-bar"><div class="aw-bar-fill" style="width:${Math.round(e.score*100)}%"></div><span>${Math.round(e.score*100)}%</span></td>
+    </tr>`).join('');
+    return `<div class="award-pred-section"><div class="award-pred-title">Top performers (60% skills · 40% qual)</div>
+      <div class="table-wrap"><table class="award-table">
+        <thead><tr><th>#</th><th>Team</th><th>Skills</th><th>Qual</th><th>Score</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+  }
+
+  // ── Single award card ──────────────────────────────────────────────────────
+  function renderAwardCard(a) {
+    const type    = classifyAward(a?.title);
+    const info    = AWARD_INFO[type] || AWARD_INFO.other;
+    const winners = extractAwardWinners(a);
+    const given   = winners.length > 0;
+
+    const quals = (a?.qualifications?.length)
+      ? `<div class="award-qual-tag">Qualifies: ${esc(a.qualifications.join(', '))}</div>` : '';
+
+    // Winner display — team numbers become clickable links; person names are plain text
+    let winnerHtml = '';
+    if (given) {
+      const chips = winners.map(w =>
+        w.kind === 'team'
+          ? `<button class="team-link award-winner-btn" data-num="${esc(w.name)}">${esc(w.name)}</button>` +
+            (w.division ? `<span class="award-winner-div">${esc(w.division)}</span>` : '')
+          : `<span class="award-person">${esc(w.name)}</span>`
+      ).join('');
+      winnerHtml = `<div class="award-winner-row"><span class="award-winner-label">Winner</span>${chips}</div>`;
+    }
+
+    // Prediction block — only for pending awards
+    let predHtml = '';
+    if (!given) {
+      if      (type === 'excellence')               predHtml = predExcellence();
+      else if (info.criteria === 'qual_rank')        predHtml = predQualRank();
+      else if (info.criteria === 'skills')           predHtml = predSkills();
+      else if (info.criteria === 'auto_gt0')         predHtml = predAutoGt0();
+      else if (info.criteria === 'skills_rank')      predHtml = predSkillsRank();
+      else if (info.criteria === 'notebook')
+        predHtml = `<div class="award-pred-note-block">Judged award — any team eligible regardless of performance standings.</div>`;
+      else
+        predHtml = `<div class="award-pred-note-block">Determined by judges or event staff.</div>`;
+    }
+
+    const badge = given
+      ? '<span class="award-given-badge">Awarded</span>'
+      : pastEvent
+      ? '<span class="award-pending-badge award-not-recorded">Not Recorded</span>'
+      : '<span class="award-pending-badge">Pending</span>';
+
+    return `<div class="award-card award-cat-${info.cat}${given ? ' award-given' : ''}">
+      <div class="award-card-header">
+        <span class="award-icon">${info.icon}</span>
+        <div class="award-card-title-block">
+          <div class="award-card-name">${esc(a?.title || type)}</div>
+          <div class="award-card-desc">${info.desc}</div>
+        </div>
+        ${badge}
+      </div>
+      ${quals}
+      ${winnerHtml}
+      ${predHtml}
+    </div>`;
+  }
+
+  // ── Build final HTML ───────────────────────────────────────────────────────
+  const CAT_ORDER = { excellence: 0, performance: 1, notebook: 2, special: 3, conduct: 4, other: 5 };
+  const sorted = [...awards].sort((a, b) => {
+    const ta = classifyAward(a.title), tb = classifyAward(b.title);
+    const pa = CAT_ORDER[AWARD_INFO[ta]?.cat] ?? 5, pb = CAT_ORDER[AWARD_INFO[tb]?.cat] ?? 5;
+    return pa !== pb ? pa - pb : (a.order || 0) - (b.order || 0);
+  });
+
+  // Worlds division filtering
+  const visible = sorted.filter(a => {
+    const t = classifyAward(a.title);
+    if (worldsQual && t === 'excellence') return false;
+    if (worldsDome && !DOME_ONLY.has(t))  return false;
+    return true;
+  });
+
+  if (!awards.length) {
+    // No data from API yet — show prediction-only cards
+    let types = ['excellence', 'champion', 'skills_champ', 'design', 'think', 'build', 'create', 'judges'];
+    if (worldsQual) types = types.filter(t => t !== 'excellence');
+    if (worldsDome) types = ['champion', 'finalist', 'excellence'];
+    const cards = types.map(type => renderAwardCard({ title: AWARD_INFO[type]?.icon + ' ' + type })).join('');
+    return `<div class="stats-section">
+      <div class="section-title">Awards</div>
+      <p class="sim-info">No awards have been announced yet — showing eligibility based on current standings.</p>
+      <div class="awards-grid">${cards}</div>
+    </div>`;
+  }
+
+  if (!visible.length) {
+    const note = worldsQual
+      ? 'Qualification division — Excellence is given at the Dome ceremony. Tournament Champions and Finalists are awarded per division.'
+      : 'No awards to display for this division.';
+    return `<div class="stats-section">
+      <div class="section-title">Awards</div>
+      <p class="sim-info">${note}</p>
+    </div>`;
+  }
+
+  const givenCount   = visible.filter(a => extractAwardWinners(a).length > 0).length;
+  const pendingCount = visible.length - givenCount;
+  const statusNote   = givenCount === visible.length
+    ? `All ${givenCount} award${givenCount !== 1 ? 's' : ''} recorded.`
+    : pendingCount === visible.length
+    ? (pastEvent ? 'Award winners were not entered in RobotEvents for this event.' : 'No awards announced yet.')
     : `${givenCount} awarded · ${pendingCount} ${pastEvent ? 'not recorded' : 'pending'}`;
 
+  const priorCacheKey = priorAwardsCacheKey(currentEvent?.program?.id, currentEvent?.season?.id);
+  const priorCached = (() => { try { const c = JSON.parse(localStorage.getItem(priorCacheKey)||'null'); return c?.ts ? new Date(c.ts).toLocaleTimeString() : null; } catch(_){ return null; } })();
+  const cacheNote = priorCached
+    ? ` · <span class="award-cache-note">History cached ${priorCached} · <button class="award-cache-bust" id="award-cache-bust">Refresh</button></span>`
+    : '';
+
   return `<div class="stats-section">
-    <div class="section-title">Awards (${sortedApiAwards.length})</div>
-    <p class="sim-info">${statusNote}</p>
-    <div class="awards-grid">${html}</div>
+    <div class="section-title">Awards (${visible.length})</div>
+    <p class="sim-info">${statusNote}${cacheNote}</p>
+    <div class="awards-grid">${visible.map(renderAwardCard).join('')}</div>
   </div>`;
 }
 
@@ -3329,15 +3569,23 @@ function renderSeasonCards(seasons, counts) {
 
 // Compute TrueSkill directly from a team's fetched season data.
 // Uses standingsState.data max combined for normalization if available.
-function computeTeamTrueSkill(skills, rankings, awards) {
+function computeTeamTrueSkill(skills, rankings, awards, pid, sid) {
   const bestDriver = Math.max(0, ...skills.filter(s => s.type === 'driver').map(s => s.score));
   const bestProg   = Math.max(0, ...skills.filter(s => s.type === 'programming').map(s => s.score));
   const combined   = bestDriver + bestProg;
   if (combined === 0 && !rankings.length) return null;
 
-  const maxCombined = standingsState.data?.length
-    ? Math.max(1, ...standingsState.data.map(t => t.combined))
-    : Math.max(combined, 1);
+  // Resolve maxCombined: prefer live standingsState for the same pid/sid, then try
+  // localStorage standings cache, then fall back to team's own score (least accurate).
+  let maxCombined = 0;
+  if (standingsState.data?.length &&
+      standingsState.programId === pid && standingsState.seasonId === sid) {
+    maxCombined = Math.max(1, ...standingsState.data.map(t => t.combined));
+  } else if (pid && sid) {
+    const cached = readStandingsCache(pid, sid);
+    if (cached?.length) maxCombined = Math.max(1, ...cached.map(t => t.combined));
+  }
+  if (!maxCombined) maxCombined = Math.max(combined, 1);
 
   const skillsScore  = combined / maxCombined;
 
@@ -3400,13 +3648,13 @@ async function openStatsView(team, season) {
       fetchTeamWorldSkillsRank(team.number, sid, team.grade),
     ]);
     clearStatus('stats');
-    renderTeamStats(events, rankings, skills, awards, worldEntry);
+    renderTeamStats(events, rankings, skills, awards, worldEntry, season.program?.id || team.program?.id, sid);
   } catch (err) {
     setStatus('stats', `Error: ${err.message}`, 'error');
   }
 }
 
-function renderTeamStats(events, rankings, skills, awards, worldEntry) {
+function renderTeamStats(events, rankings, skills, awards, worldEntry, pid, sid) {
   const el = document.getElementById('stats-content');
   const eventMap = {};
   events.forEach(ev => { eventMap[ev.id] = ev; });
@@ -3421,7 +3669,7 @@ function renderTeamStats(events, rankings, skills, awards, worldEntry) {
   const worldSkillsRank = worldEntry?.rank
     ?? (skills.map(s => s.rank).filter(n => n != null && n > 0).reduce((a, b) => Math.min(a, b), Infinity) || null);
 
-  const trueSkillScore = computeTeamTrueSkill(skills, rankings, awards);
+  const trueSkillScore = computeTeamTrueSkill(skills, rankings, awards, pid, sid);
 
   el.innerHTML = [
     metricsHTML(events.length, bestRank, worldSkillsRank, awards.length, trueSkillScore),
@@ -3433,7 +3681,10 @@ function renderTeamStats(events, rankings, skills, awards, worldEntry) {
   el.querySelectorAll('.clickable-row[data-event-id]').forEach(row => {
     const ev = eventMap[+row.dataset.eventId];
     if (!ev) return;
-    row.addEventListener('click', () => openEventDetail(ev));
+    row.addEventListener('click', () => {
+      pendingHighlightTeam = currentTeam?.number;
+      openEventDetail(ev);
+    });
   });
 }
 
@@ -3733,7 +3984,14 @@ async function openTeamEventView(teamNumber) {
       </div>
     </div>`;
 
-  document.getElementById('back-to-event-link').addEventListener('click', () => showView('view-event'));
+  document.getElementById('back-to-event-link').addEventListener('click', async () => {
+    pendingHighlightTeam = currentTeamAtEvent;
+    activeEventTab = 'rankings';
+    showView('view-event');
+    document.querySelectorAll('.detail-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === 'rankings'));
+    await loadEventTabContent();
+  });
 
   document.getElementById('view-season-history-btn').addEventListener('click', async () => {
     setStatus('team-event', 'Loading…');
@@ -4179,31 +4437,36 @@ async function addCompareTeam(number) {
     if (!season) { setStatus('compare', `No season data for ${number}.`, 'error'); return; }
 
     const sid = season.id;
+    const pid = season.program?.id || 1;
     const [rankings, skills, awards, worldEntry, allMatches] = await Promise.all([
       fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/awards?season[]=${sid}`),
       fetchTeamWorldSkillsRank(team.number, sid, team.grade),
-      fetchAllPages(`/teams/${team.id}/matches?season[]=${sid}&round[]=2`),
+      fetchAllPages(`/teams/${team.id}/matches?season[]=${sid}`),
     ]);
 
-    // Compute per-event OPR from the team's qual matches, then average
+    // Compute per-event OPR from qual matches only, then average across events
     const matchesByEvent = {};
     allMatches.forEach(m => {
+      if (m.round !== 2) return; // quals only
       const eid = m.event?.id;
       if (eid) { (matchesByEvent[eid] = matchesByEvent[eid] || []).push(m); }
     });
     const oprValues = [];
     Object.values(matchesByEvent).forEach(evMatches => {
       const opr = computeOPR(evMatches);
+      // team.number matches t.team?.name in match data (both are team number strings)
       const entry = opr[team.number];
-      if (entry?.opr != null && entry.opr > 0) oprValues.push(entry.opr);
+      if (entry?.opr != null && Number.isFinite(entry.opr)) oprValues.push(entry.opr);
     });
     const avgOPR = oprValues.length ? oprValues.reduce((a, b) => a + b, 0) / oprValues.length : null;
 
     const slot = {
       team,
       season,
+      pid,
+      sid,
       eventsPlayed: allEvents.filter(e => e.season?.id === sid).length,
       rankings,
       skills,
@@ -4240,7 +4503,7 @@ function renderCompareContent() {
   // ── Per-slot derived stats
   const derived = compareState.slots.map((s, i) => {
     if (!s) return null;
-    const { team, rankings, skills, awards, worldEntry, eventsPlayed, avgOPR } = s;
+    const { team, rankings, skills, awards, worldEntry, eventsPlayed, avgOPR, pid, sid } = s;
 
     const driver = skills.filter(x => x.type === 'driver');
     const prog   = skills.filter(x => x.type === 'programming');
@@ -4264,7 +4527,7 @@ function renderCompareContent() {
 
     const worldRank = worldEntry?.rank ?? null;
 
-    const rating = computeTeamTrueSkill(skills, rankings, awards);
+    const rating = computeTeamTrueSkill(skills, rankings, awards, pid, sid);
     const awardsPerEvent = eventsPlayed > 0 ? awards.length / eventsPlayed : null;
 
     const excellenceCount = awards.filter(a => /excellence/i.test(a.title || '')).length;

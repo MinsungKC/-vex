@@ -34,10 +34,13 @@ let cachedPriorExcellenceSet = null; // Set of team numbers who won Excellence a
 let currentTeamAtEvent  = null;
 let pendingHighlightTeam = null; // team number to highlight after rankings load
 let predWeights         = JSON.parse(localStorage.getItem('predWeights') || 'null') || { opr: 50, ranking: 25, skills: 25 };
-let predTuning          = JSON.parse(localStorage.getItem('predTuning')  || 'null') || {
-  wOPR: 1.0, wCCWM: 0.3, wDPR: 0.2, wWR: 0.3,
-  wSkills: 0.1, wConsist: 0.1, wForm: 0.2, tanhScale: 0.22,
-};
+const PRED_TUNING_DEFAULTS = { wOPR: 1.0, wCCWM: 0.3, wDPR: 0.2, wWR: 0.3, wSkills: 0.1, wConsist: 0.1, wForm: 0.2, tanhScale: 0.22, noise: 0.05 };
+// Always merge with defaults so adding new keys never breaks on old localStorage values.
+let predTuning = Object.assign({}, PRED_TUNING_DEFAULTS, (() => {
+  const stored = JSON.parse(localStorage.getItem('predTuning') || 'null') || {};
+  // Drop any legacy keys (e.g. old ccwmW) that no longer exist in defaults
+  return Object.fromEntries(Object.entries(stored).filter(([k]) => k in PRED_TUNING_DEFAULTS));
+})());
 let _predStatCache = null; // invalidated when event data changes
 let showMatchPredictions = JSON.parse(localStorage.getItem('showMatchPredictions') || 'false');
 
@@ -269,21 +272,77 @@ async function checkWatchlistUpdates() {
   });
 })();
 
+// ── UI mode (simple / complex) + Glass mode ───────────────────────────────
+(function initUIMode() {
+  const uiMode   = localStorage.getItem('uiMode')   || 'simple';
+  const glassOn  = localStorage.getItem('glassMode') === 'true';
+
+  document.documentElement.dataset.uiMode = uiMode;
+  if (glassOn) document.body.classList.add('glass-mode');
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const modeBtn  = document.getElementById('mode-toggle');
+    const glassBtn = document.getElementById('glass-toggle');
+
+    function syncModeBtn() {
+      const mode = document.documentElement.dataset.uiMode;
+      modeBtn.textContent = mode === 'simple' ? 'Simple' : 'Complex';
+      modeBtn.classList.toggle('mode-active', mode === 'complex');
+    }
+    function syncGlassBtn() {
+      glassBtn.classList.toggle('glass-active', document.body.classList.contains('glass-mode'));
+    }
+
+    syncModeBtn();
+    syncGlassBtn();
+
+    modeBtn.addEventListener('click', () => {
+      const next = document.documentElement.dataset.uiMode === 'simple' ? 'complex' : 'simple';
+      document.documentElement.dataset.uiMode = next;
+      localStorage.setItem('uiMode', next);
+      syncModeBtn();
+    });
+
+    glassBtn.addEventListener('click', () => {
+      const on = document.body.classList.toggle('glass-mode');
+      localStorage.setItem('glassMode', String(on));
+      syncGlassBtn();
+    });
+  });
+})();
+
+// ── Loading bar ────────────────────────────────────────────────────────────
+let _fetchCount = 0;
+function _showLoader() {
+  const el = document.getElementById('global-loader');
+  if (el) el.classList.add('active');
+}
+function _hideLoader() {
+  const el = document.getElementById('global-loader');
+  if (el) el.classList.remove('active');
+}
+
 // ── API helpers ────────────────────────────────────────────────────────────
 async function apiFetch(path) {
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetch(BASE + path, {
-      headers: { Authorization: `Bearer ${API_TOKEN}`, Accept: 'application/json' }
-    });
-    if (res.status === 429) {
-      // Respect Retry-After header (seconds), fallback to exponential backoff
-      const wait = parseInt(res.headers.get('Retry-After') || '0', 10) * 1000
-                   || Math.min(4000 * Math.pow(2, attempt), 64000);
-      await sleep(wait);
-      continue;
+  _fetchCount++;
+  if (_fetchCount === 1) _showLoader();
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(BASE + path, {
+        headers: { Authorization: `Bearer ${API_TOKEN}`, Accept: 'application/json' }
+      });
+      if (res.status === 429) {
+        const wait = parseInt(res.headers.get('Retry-After') || '0', 10) * 1000
+                     || Math.min(4000 * Math.pow(2, attempt), 64000);
+        await sleep(wait);
+        continue;
+      }
+      if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+      return await res.json();
     }
-    if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-    return res.json();
+  } finally {
+    _fetchCount--;
+    if (_fetchCount === 0) _hideLoader();
   }
 }
 
@@ -313,7 +372,7 @@ async function fetchAllPages(path) {
 }
 
 // ── View routing ───────────────────────────────────────────────────────────
-const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings', 'view-compare', 'view-live'];
+const VIEWS = ['view-search', 'view-event', 'view-seasons', 'view-stats', 'view-team-event', 'view-map', 'view-standings', 'view-compare', 'view-live', 'view-h2h'];
 function showView(id) {
   VIEWS.forEach(v => document.getElementById(v).classList.toggle('hidden', v !== id));
   if (id !== 'view-live') stopLivePolling();
@@ -330,6 +389,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (which === 'standings') { openStandingsView(); return; }
     if (which === 'compare') { openCompareView(); return; }
     if (which === 'live') { openLiveView(); return; }
+    if (which === 'h2h') { openH2HView(); return; }
     document.getElementById('panel-team').classList.toggle('hidden', which !== 'team');
     document.getElementById('panel-event').classList.toggle('hidden', which !== 'event');
     if (which === 'event') onEventTabActivated();
@@ -367,6 +427,13 @@ document.getElementById('back-from-compare').addEventListener('click', () => {
   document.getElementById('panel-event').classList.add('hidden');
 });
 document.getElementById('back-from-live').addEventListener('click', () => {
+  showView('view-search');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-tab="team"]')?.classList.add('active');
+  document.getElementById('panel-team').classList.remove('hidden');
+  document.getElementById('panel-event').classList.add('hidden');
+});
+document.getElementById('back-from-h2h').addEventListener('click', () => {
   showView('view-search');
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="team"]')?.classList.add('active');
@@ -618,18 +685,18 @@ function renderDetailTabBar() {
     { id: 'rankings', label: 'Rankings' },
     { id: 'matches',  label: 'Matches'  },
     { id: 'bracket',  label: 'Bracket'  },
-    { id: 'simulate', label: 'Sim'      },
-    { id: 'picklist', label: 'Pick List'},
-    { id: 'draft',    label: 'Draft Sim'},
+    { id: 'simulate', label: 'Sim',        complex: true },
+    { id: 'picklist', label: 'Pick List',  complex: true },
+    { id: 'draft',    label: 'Draft Sim',  complex: true },
     { id: 'awards',   label: 'Awards'   },
     { id: 'skills',   label: 'Skills'   },
-    { id: 'teams',    label: 'Teams'    },
-    { id: 'map',      label: 'Map'      },
+    { id: 'teams',    label: 'Teams',      complex: true },
+    { id: 'map',      label: 'Map',        complex: true },
   ];
   document.getElementById('event-tabs-bar').innerHTML = `
     <div class="detail-tabs">
       ${tabs.map(t => `
-        <button class="detail-tab ${t.id === activeEventTab ? 'active' : ''}" data-tab="${t.id}">
+        <button class="detail-tab${t.id === activeEventTab ? ' active' : ''}${t.complex ? ' complex-only' : ''}" data-tab="${t.id}">
           ${t.label}
         </button>`).join('')}
     </div>`;
@@ -679,20 +746,23 @@ function attachWeightListeners(el, onUpdate) {
 
 // Grid-search over (ccwmW, tanhScale) to maximise win-direction accuracy
 // on completed matches. Returns { ccwmW, tanhScale, accuracy, curve }.
+// Coordinate-descent optimizer for all 8 prediction parameters.
+// Builds the stat cache once, then tunes weights to maximise winner accuracy.
 function autoTunePredictions() {
   const played = cachedEventMatches.filter(m => m.round === 2 && matchIsScored(m));
   if (played.length < 5) return null;
 
-  const ccwmVals  = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5];
-  const tanhVals  = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40];
+  // Build stat cache once — normalized values don't depend on weights
+  const cache = buildTeamStatCache();
+  if (!Object.keys(cache).length) return null;
 
-  let bestAcc = -1, bestCCWM = predTuning.ccwmW, bestTanh = predTuning.tanhScale;
-  const curve = []; // { ccwmW, acc } for the best tanhScale per ccwmW
-
-  function evalAccuracy() {
+  // Helper: count fraction of winner predictions that match actual outcome
+  function evalAccuracy(params) {
+    const saved = { ...predTuning };
+    Object.assign(predTuning, params);
     let correct = 0, total = 0;
     for (const m of played) {
-      const pred = predictMatch(m);
+      const pred = predictMatch(m, cache);
       if (!pred) continue;
       const all = m.alliances || [];
       const red  = all.find(a => a.color === 'red');
@@ -702,31 +772,65 @@ function autoTunePredictions() {
       if (pred.winner === actual) correct++;
       total++;
     }
+    Object.assign(predTuning, saved);
     return total > 0 ? correct / total : 0;
   }
 
-  for (const cw of ccwmVals) {
-    predTuning.ccwmW = cw;
-    let bestAccForCCWM = -1;
-    for (const ts of tanhVals) {
-      predTuning.tanhScale = ts;
-      const acc = evalAccuracy();
-      if (acc > bestAccForCCWM) bestAccForCCWM = acc;
-      if (acc > bestAcc) {
-        bestAcc = acc; bestCCWM = cw; bestTanh = ts;
+  // Search grid per parameter (fine-grained around typical useful ranges)
+  const PARAM_GRIDS = {
+    wOPR:     [0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+    wCCWM:    [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
+    wDPR:     [0, 0.2, 0.4, 0.6, 0.8, 1.0],
+    wWR:      [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25],
+    wSkills:  [0, 0.15, 0.3, 0.5, 0.75, 1.0],
+    wConsist: [0, 0.1, 0.2, 0.35, 0.5],
+    wForm:    [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25],
+    tanhScale:[0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50],
+    noise:    [0, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30],
+  };
+
+  // Naive OPR-only baseline for comparison
+  const naiveParams = { wOPR: 1, wCCWM: 0, wDPR: 0, wWR: 0, wSkills: 0, wConsist: 0, wForm: 0, tanhScale: 0.22, noise: 0.05 };
+  const naiveAcc    = evalAccuracy(naiveParams);
+
+  // Coordinate descent: 4 passes over all params
+  const best = { ...predTuning };
+  let bestAcc = evalAccuracy(best);
+
+  for (let pass = 0; pass < 4; pass++) {
+    for (const key of Object.keys(PARAM_GRIDS)) {
+      let bestVal = best[key];
+      for (const v of PARAM_GRIDS[key]) {
+        const candidate = { ...best, [key]: v };
+        const acc = evalAccuracy(candidate);
+        if (acc > bestAcc + 1e-9) { bestAcc = acc; bestVal = v; best[key] = v; }
       }
+      best[key] = bestVal;
     }
-    curve.push({ ccwmW: cw, acc: bestAccForCCWM });
   }
 
-  predTuning.ccwmW = bestCCWM;
-  predTuning.tanhScale = bestTanh;
+  // Per-weight importance: drop each to 0, measure accuracy fall
+  const importance = {};
+  for (const key of ['wOPR', 'wCCWM', 'wDPR', 'wWR', 'wSkills', 'wConsist', 'wForm']) {
+    const withoutKey = { ...best, [key]: 0 };
+    const accWithout = evalAccuracy(withoutKey);
+    importance[key] = Math.max(0, bestAcc - accWithout); // how much this stat contributes
+  }
+
+  Object.assign(predTuning, best);
+  _predStatCache = cache; // use the freshly-built cache going forward
   localStorage.setItem('predTuning', JSON.stringify(predTuning));
-  return { ccwmW: bestCCWM, tanhScale: bestTanh, accuracy: Math.round(bestAcc * 100), curve };
+  return {
+    params: best,
+    accuracy: Math.round(bestAcc * 100),
+    naiveAcc: Math.round(naiveAcc * 100),
+    matchCount: played.length,
+    importance,
+  };
 }
 
 function attachMatchTabListeners(el) {
-  // Prediction show/hide toggle
+  // Show/hide predictions toggle
   const showToggle = el.querySelector('#pred-show-toggle');
   if (showToggle) {
     showToggle.addEventListener('click', () => {
@@ -736,8 +840,63 @@ function attachMatchTabListeners(el) {
       reRenderMatchContainer(el);
     });
   }
+
+  // Old fallback-weight sliders (OPR/ranking/skills proxy)
   attachWeightListeners(el, () => reRenderMatchContainer(el));
 
+  // Weights panel toggle
+  const wToggle = el.querySelector('#pred-weights-toggle');
+  const wBody   = el.querySelector('#pred-weights-body');
+  if (wToggle && wBody) {
+    wToggle.addEventListener('click', () => {
+      const hidden = wBody.classList.toggle('hidden');
+      wToggle.querySelector('.pred-chevron').textContent = hidden ? '▼' : '▲';
+    });
+  }
+
+  // Helper: refresh the live accuracy badge in the toggle button + inline header
+  function refreshLiveAcc() {
+    const acc = computeLiveAccuracy();
+    const badge  = el.querySelector('#tune-live-acc');
+    const inline = el.querySelector('#tune-live-inline');
+    if (acc) {
+      if (badge)  { badge.textContent = acc.pct + '% on ' + acc.n + ' matches'; badge.style.display = ''; }
+      if (inline) inline.textContent = acc.pct + '% accuracy (' + acc.n + ' played)';
+    }
+  }
+
+  // Tuning sliders — update predTuning, invalidate cache, refresh accuracy live
+  el.querySelectorAll('.tune-slider').forEach(slider => {
+    slider.addEventListener('input', () => {
+      const key = slider.dataset.tunekey;
+      const val = +slider.value;
+      predTuning[key] = val;
+      _predStatCache = null; // form/consist in cache depend on match weights indirectly
+      localStorage.setItem('predTuning', JSON.stringify(predTuning));
+      // Update displayed value + fill bar
+      const valEl  = el.querySelector('#tuneval-' + key);
+      const fillEl = el.querySelector('#tunefill-' + key);
+      if (valEl)  valEl.textContent = val.toFixed(2);
+      if (fillEl) fillEl.style.width = Math.round((val / +slider.dataset.max) * 100) + '%';
+      refreshLiveAcc();
+      reRenderMatchContainer(el);
+    });
+  });
+
+  // Reset to defaults
+  el.querySelector('#pred-reset-btn')?.addEventListener('click', () => {
+    Object.assign(predTuning, PRED_TUNING_DEFAULTS);
+    _predStatCache = null;
+    localStorage.setItem('predTuning', JSON.stringify(predTuning));
+    // Re-render entire panel so sliders snap to defaults
+    const container = el.querySelector('#matches-table-container');
+    const panelEl   = container ? container.previousElementSibling : null;
+    if (panelEl) panelEl.outerHTML = renderPredWeightsPanel();
+    attachMatchTabListeners(el);
+    reRenderMatchContainer(el);
+  });
+
+  // Auto-tune
   const autoTuneBtn = el.querySelector('#pred-autotune-btn');
   if (autoTuneBtn) {
     autoTuneBtn.addEventListener('click', () => {
@@ -746,32 +905,47 @@ function attachMatchTabListeners(el) {
       setTimeout(() => {
         const result = autoTunePredictions();
         const resultEl = el.querySelector('#autotune-result');
-        const wBody = el.querySelector('#pred-weights-body');
         if (!result) {
           if (resultEl) resultEl.innerHTML = '<p class="tune-msg">Need ≥5 played matches to tune.</p>';
           autoTuneBtn.textContent = '🧪 Auto-Tune';
           autoTuneBtn.disabled = false;
           return;
         }
-        // Render small accuracy curve
-        const maxAcc = Math.max(...result.curve.map(c => c.acc));
-        const barItems = result.curve.map(c => {
-          const pct = maxAcc > 0 ? (c.acc / maxAcc) * 100 : 0;
-          const isBest = c.ccwmW === result.ccwmW;
-          return '<div class="tune-bar-wrap" title="CCWM×' + c.ccwmW + ': ' + Math.round(c.acc * 100) + '%">' +
-            '<div class="tune-bar' + (isBest ? ' tune-bar-best' : '') + '" style="height:' + Math.round(pct) + '%"></div>' +
-            '<span class="tune-bar-label">' + c.ccwmW + '</span></div>';
+        // Sync sliders to newly-tuned values
+        el.querySelectorAll('.tune-slider').forEach(s => {
+          const key = s.dataset.tunekey;
+          if (predTuning[key] !== undefined) {
+            s.value = predTuning[key];
+            const valEl  = el.querySelector('#tuneval-' + key);
+            const fillEl = el.querySelector('#tunefill-' + key);
+            if (valEl)  valEl.textContent  = predTuning[key].toFixed(2);
+            if (fillEl) fillEl.style.width = Math.round((predTuning[key] / +s.dataset.max) * 100) + '%';
+          }
+        });
+        // Importance bars
+        const STAT_LABELS = { wOPR:'OPR', wCCWM:'CCWM', wDPR:'Defence', wWR:'Win Rate', wSkills:'Skills', wConsist:'Consistency', wForm:'Form' };
+        const maxImp  = Math.max(...Object.values(result.importance), 0.001);
+        const impBars = Object.entries(STAT_LABELS).map(([key, label]) => {
+          const imp = result.importance[key] ?? 0;
+          const pct = Math.round((imp / maxImp) * 100);
+          return '<div class="tune-imp-row">' +
+            '<span class="tune-imp-label">' + label + '</span>' +
+            '<div class="tune-imp-bar-bg"><div class="tune-imp-bar' + (imp >= maxImp - 1e-9 ? ' tune-bar-best' : '') + '" style="width:' + pct + '%"></div></div>' +
+            '<span class="tune-imp-val">w=' + result.params[key].toFixed(2) + '</span>' +
+            '</div>';
         }).join('');
+        const gain = result.accuracy - result.naiveAcc;
         if (resultEl) resultEl.innerHTML =
           '<div class="tune-result">' +
-          '<div class="tune-summary">Best: CCWM×<strong>' + result.ccwmW + '</strong> · curve <strong>' + result.tanhScale + '</strong> → <strong>' + result.accuracy + '%</strong> accuracy</div>' +
-          '<div class="tune-bars">' + barItems + '</div>' +
-          '</div>';
-        // Keep weights panel open
+          '<div class="tune-summary"><strong>' + result.accuracy + '%</strong> on ' + result.matchCount + ' matches' +
+          ' · OPR-only: ' + result.naiveAcc + '% · gain: <span class="' + (gain >= 0 ? 'tune-gain' : 'tune-loss') + '">' +
+          (gain >= 0 ? '+' : '') + gain + '%</span></div>' +
+          '<div class="tune-imp-title">Stat importance (accuracy drop when zeroed):</div>' +
+          impBars + '</div>';
         if (wBody) wBody.classList.remove('hidden');
         autoTuneBtn.textContent = '🧪 Auto-Tune ✓';
-        autoTuneBtn.classList.add('active');
         autoTuneBtn.disabled = false;
+        refreshLiveAcc();
         reRenderMatchContainer(el);
       }, 0);
     });
@@ -1226,11 +1400,17 @@ function teamAllianceScores(name) {
 
 // Build a normalized [0,1] stat block for every team in the current event.
 // Each dimension is min-max scaled within the field so weights are comparable.
+// Only includes teams actually in this event (not season-OPR teams from other events).
 function buildTeamStatCache() {
+  // Collect every team seen in this event's data
   const teamSet = new Set([
     ...Object.keys(cachedOPR),
-    ...Object.keys(cachedSeasonOPR),
     ...Object.keys(cachedEventRankings),
+    ...cachedEventMatches.flatMap(m =>
+      (m.alliances || []).flatMap(a =>
+        (a.teams || []).map(t => t.team?.name).filter(Boolean)
+      )
+    ),
   ]);
   if (!teamSet.size) return {};
 
@@ -1315,18 +1495,19 @@ function getPredStatCache() {
   return _predStatCache;
 }
 
-// ── Effective OPR: current event → season fallback → rankings/skills proxy ─
+// ── Effective OPR: current event → season fallback → H2H cache → proxy ─────
 function effectiveOPR(name) {
   const entry = cachedOPR[name];
-  // Only trust computed OPR if it's above a floor of 2 pts.
-  // Gaussian elimination can produce small positive artifacts for under-constrained teams;
-  // those would round to 0 in predictMatch and corrupt predictions.
   if (entry?.opr != null && entry.opr >= 2) return entry.opr;
   const s = cachedSeasonOPR[name];
   if (s != null) {
-    const val = typeof s === 'object' ? s.opr : s; // handle both old number and new {opr,ccwm} format
+    const val = typeof s === 'object' ? s.opr : s;
     if (val > 0) return val;
   }
+  // Use H2H season data when available (computed from average match scores, reliable)
+  const h2h = h2hTeamData[name];
+  if (h2h?.opr > 2) return h2h.opr;
+
   // Proxy: rankings/skills strength scaled to event or season OPR magnitude
   const hasRank = Object.keys(cachedEventRankings).length > 0;
   const hasSk   = Object.keys(cachedEventSkills).length > 0;
@@ -1344,30 +1525,29 @@ function effectiveOPR(name) {
   const hasOPRData = allOPRVals.length > 0;
   const maxOPR     = hasOPRData ? Math.max(...allOPRVals) : 1;
   const seasonVals = Object.values(cachedSeasonOPR).map(s => typeof s === 'object' ? s.opr : s).filter(v => v > 0);
-  const hasSeasonOPR = seasonVals.length > 0;
-  const maxSeasonOPR = hasSeasonOPR ? Math.max(...seasonVals) : 1;
+  // Also include H2H OPR values as a baseline reference
+  const h2hVals = Object.values(h2hTeamData).map(d => d.opr).filter(v => v > 2);
+  const allSeasonVals = [...seasonVals, ...h2hVals];
+  const hasSeasonOPR = allSeasonVals.length > 0;
+  const maxSeasonOPR = hasSeasonOPR ? Math.max(...allSeasonVals) : 1;
   const BASELINE     = hasSeasonOPR ? maxSeasonOPR : 30;
   return str * (hasOPRData ? maxOPR : BASELINE);
 }
 
-// CCWM-adjusted "strength" for win probability: OPR + partial CCWM credit.
-// CCWM > 0 means the team contributes more than they allow through — genuinely better.
-// When only OPR is available (no event data yet), falls back to OPR directly.
 function effectiveStrength(name) {
-  const cw = predTuning.ccwmW;
+  const cache = getPredStatCache();
+  if (cache[name]) return Math.max(0.01, teamStrength(name, cache));
+  // fallback when cache has no entry for this team
   const entry = cachedOPR[name];
-  if (entry?.opr >= 2) {
-    return Math.max(1, entry.opr + cw * entry.ccwm);
-  }
+  if (entry?.opr >= 2) return Math.max(1, entry.opr + (predTuning.wCCWM ?? 0.3) * entry.ccwm);
   const s = cachedSeasonOPR[name];
   if (s != null) {
-    if (typeof s === 'object' && s.ccwm != null) {
-      return Math.max(1, s.opr + cw * s.ccwm);
-    }
+    if (typeof s === 'object' && s.ccwm != null)
+      return Math.max(1, s.opr + (predTuning.wCCWM ?? 0.3) * s.ccwm);
     const val = typeof s === 'object' ? s.opr : s;
     if (val > 0) return val;
   }
-  return effectiveOPR(name); // pure fallback
+  return effectiveOPR(name);
 }
 
 // Compute typical score standard deviation from scored event matches.
@@ -1397,10 +1577,9 @@ function randn() {
 }
 
 // ── Match prediction ───────────────────────────────────────────────────────
-// Scores predicted via OPR sums (calibrated to actual point contributions).
-// Winner + confidence predicted via CCWM-adjusted strength (accounts for defense).
-// Confidence uses a logistic curve so large OPR gaps don't over-inflate certainty.
-function predictMatch(m) {
+// Score predicted via OPR sums. Win direction + confidence via multi-stat model.
+// Accepts an optional prebuilt stat cache (used by auto-tuner to avoid rebuilds).
+function predictMatch(m, _cache) {
   const alliances = m.alliances || [];
   const red  = alliances.find(a => a.color === 'red')  || alliances[0] || {};
   const blue = alliances.find(a => a.color === 'blue') || alliances[1] || {};
@@ -1408,18 +1587,37 @@ function predictMatch(m) {
   const blueTeams = (blue.teams || []).map(t => t.team?.name).filter(Boolean);
   if (!redTeams.length || !blueTeams.length) return null;
 
-  // OPR → predicted alliance scores
+  // OPR sums → predicted scores (OPR is purpose-built for score prediction)
   const oprRed  = redTeams.reduce((s, n)  => s + effectiveOPR(n), 0);
   const oprBlue = blueTeams.reduce((s, n) => s + effectiveOPR(n), 0);
   if (oprRed + oprBlue <= 0) return null;
 
-  // CCWM-adjusted strength → win probability (better discriminator than OPR alone)
-  const strRed  = redTeams.reduce((s, n)  => s + effectiveStrength(n), 0);
-  const strBlue = blueTeams.reduce((s, n) => s + effectiveStrength(n), 0);
+  // Multi-stat strength → win direction + confidence
+  const cache   = _cache ?? getPredStatCache();
+  const strRed  = redTeams.reduce((s, n)  => s + teamStrength(n, cache), 0);
+  const strBlue = blueTeams.reduce((s, n) => s + teamStrength(n, cache), 0);
   const total   = strRed + strBlue;
-  const diff    = Math.abs(strRed - strBlue);
 
-  const confidence = Math.min(87, Math.round(50 + 37 * Math.tanh(diff / (total * predTuning.tanhScale))));
+  // Fallback when multi-stat cache has no data yet: use OPR for direction only
+  if (total <= 0) {
+    const winner = oprRed > oprBlue ? 'red' : oprBlue > oprRed ? 'blue' : 'tie';
+    return {
+      redScore: Math.max(0, Math.round(oprRed)),
+      blueScore: Math.max(0, Math.round(oprBlue)),
+      winner,
+      confidence: 55,
+    };
+  }
+
+  const diff = Math.abs(strRed - strBlue);
+  const ts    = predTuning.tanhScale > 0 ? predTuning.tanhScale : 0.22;
+  const noise = Math.max(0, Math.min(0.5, predTuning.noise ?? 0.05));
+
+  // Base win probability (0.5 = toss-up, 0.87 = highly confident)
+  const baseProb = 0.5 + 0.45 * Math.tanh(diff / (total * ts));
+  // Noise flattens the probability toward 0.5 (DC, stuck bot = random outcome)
+  const adjProb  = (1 - noise) * baseProb + noise * 0.5;
+  const confidence = Math.min(87, Math.round(adjProb * 100));
 
   return {
     redScore:  Math.max(0, Math.round(oprRed)),
@@ -1430,27 +1628,73 @@ function predictMatch(m) {
 }
 
 // ── Prediction weights panel ───────────────────────────────────────────────
+// Computes live accuracy on played matches given current predTuning.
+function computeLiveAccuracy() {
+  const played = cachedEventMatches.filter(m => m.round === 2 && matchIsScored(m));
+  if (!played.length) return null;
+  const cache = getPredStatCache();
+  let correct = 0, total = 0;
+  for (const m of played) {
+    const pred = predictMatch(m, cache);
+    if (!pred) continue;
+    const all = m.alliances || [];
+    const red  = all.find(a => a.color === 'red');
+    const blue = all.find(a => a.color === 'blue');
+    if (!red || !blue || red.score == null || blue.score == null) continue;
+    const actual = red.score > blue.score ? 'red' : blue.score > red.score ? 'blue' : 'tie';
+    if (pred.winner === actual) correct++;
+    total++;
+  }
+  return total > 0 ? { pct: Math.round(correct / total * 100), n: total } : null;
+}
+
 function renderPredWeightsPanel() {
-  const w   = predWeights;
   const on  = showMatchPredictions;
-  const row = (label, key) =>
-    '<div class="weight-row">' +
-    '<label class="weight-label">' + label + '</label>' +
-    '<input type="range" class="weight-slider" min="0" max="100" value="' + w[key] + '" data-key="' + key + '" />' +
-    '<span class="weight-val" data-key="' + key + '">' + w[key] + '</span>' +
-    '</div>';
-  const tuned = predTuning.ccwmW !== 0.45 || predTuning.tanhScale !== 0.22;
-  return '<div class="pred-controls-bar">' +
+  const t   = predTuning;
+
+  // Tuning sliders: key, label, max value (all weights 0-2, tanhScale 0-0.5)
+  const TUNE_ROWS = [
+    { key: 'wOPR',      label: 'OPR',          max: 2.0, step: 0.05 },
+    { key: 'wCCWM',     label: 'CCWM',          max: 2.0, step: 0.05 },
+    { key: 'wDPR',      label: 'Defence (DPR)', max: 2.0, step: 0.05 },
+    { key: 'wWR',       label: 'Win Rate',      max: 2.0, step: 0.05 },
+    { key: 'wSkills',   label: 'Skills',        max: 2.0, step: 0.05 },
+    { key: 'wConsist',  label: 'Consistency',   max: 1.0, step: 0.05 },
+    { key: 'wForm',     label: 'Recent Form',   max: 2.0, step: 0.05 },
+    { key: 'tanhScale', label: 'Curve Width',   max: 0.5,  step: 0.01 },
+    { key: 'noise',     label: 'Match Noise',   max: 0.5,  step: 0.01 },
+  ];
+
+  const liveAcc = computeLiveAccuracy();
+  const accBadge = liveAcc
+    ? '<span class="tune-live-acc" id="tune-live-acc">' + liveAcc.pct + '% on ' + liveAcc.n + ' matches</span>'
+    : '<span class="tune-live-acc" id="tune-live-acc" style="display:none"></span>';
+
+  const tuningRows = TUNE_ROWS.map(r => {
+    const val = t[r.key] ?? PRED_TUNING_DEFAULTS[r.key];
+    const pct = Math.round((val / r.max) * 100);
+    return '<div class="tune-row">' +
+      '<label class="tune-row-label">' + r.label + '</label>' +
+      '<input type="range" class="tune-slider" min="0" max="' + r.max + '" step="' + r.step + '" value="' + val + '" ' +
+        'data-tunekey="' + r.key + '" data-max="' + r.max + '" />' +
+      '<span class="tune-row-val" id="tuneval-' + r.key + '">' + val.toFixed(2) + '</span>' +
+      '<div class="tune-row-bar"><div class="tune-row-fill" id="tunefill-' + r.key + '" style="width:' + pct + '%"></div></div>' +
+      '</div>';
+  }).join('');
+
+  return '<div class="complex-only"><div class="pred-controls-bar">' +
     '<button id="pred-show-toggle" class="pred-toggle-btn' + (on ? ' active' : '') + '">Show Predictions</button>' +
-    '<button class="pred-weights-toggle" id="pred-weights-toggle">⚙ Weights <span class="pred-chevron">▼</span></button>' +
-    '<button class="pred-toggle-btn pred-autotune-btn' + (tuned ? ' active' : '') + '" id="pred-autotune-btn" title="Grid-search CCWM blend &amp; curve steepness to maximise winner accuracy on played matches">🧪 Auto-Tune' + (tuned ? ' ✓' : '') + '</button>' +
+    '<button class="pred-weights-toggle" id="pred-weights-toggle">⚙ Weights ' + accBadge + ' <span class="pred-chevron">▼</span></button>' +
+    '<button class="pred-toggle-btn pred-autotune-btn" id="pred-autotune-btn" title="Coordinate-descent over 7 stats · 4 passes">🧪 Auto-Tune</button>' +
+    '<button class="pred-toggle-btn" id="pred-reset-btn" title="Reset to defaults">↺ Reset</button>' +
     '</div>' +
     '<div class="pred-weights-body hidden" id="pred-weights-body">' +
-    row('Current Event (OPR)', 'opr') +
-    row('Win Rate (Rankings)',  'ranking') +
-    row('Skills Scores',        'skills') +
+    '<div class="tune-section-title">Prediction stat weights <span class="tune-live-inline" id="tune-live-inline">' +
+      (liveAcc ? liveAcc.pct + '% accuracy (' + liveAcc.n + ' played)' : 'Load matches to see accuracy') +
+    '</span></div>' +
+    tuningRows +
     '<div id="autotune-result"></div>' +
-    '</div>';
+    '</div></div>';
 }
 
 // ── Matches ────────────────────────────────────────────────────────────────
@@ -1859,8 +2103,9 @@ function runRankingSimulation(nSims, fromMatchNum = null) {
 
       // Sample scores from a Gaussian centred on the OPR prediction.
       // Win probability and tie rate emerge naturally — no hard-coded numbers.
-      const simRed  = Math.max(0, Math.round(pred.redScore  + randn() * scoreStdDev));
-      const simBlue = Math.max(0, Math.round(pred.blueScore + randn() * scoreStdDev));
+      const noiseFactor = 1 + (predTuning.noise ?? 0.05) * 4;
+      const simRed  = Math.max(0, Math.round(pred.redScore  + randn() * scoreStdDev * noiseFactor));
+      const simBlue = Math.max(0, Math.round(pred.blueScore + randn() * scoreStdDev * noiseFactor));
       const winner  = simRed > simBlue ? 'red' : simBlue > simRed ? 'blue' : 'tie';
 
       // SP = the losing alliance's actual simulated score (correct VEX rule)
@@ -3020,11 +3265,17 @@ function geodesicPoints(lat1, lon1, lat2, lon2, n = 64) {
 }
 
 async function openMapView(eventId) {
+  const wasEvent = !!mapState.eventId;
   mapState.eventId    = eventId || null;
   mapState.sourceView = eventId ? 'view-event' : 'view-search';
   if (eventId) mapState.grade = 'all';
   showView('view-map');
   if (!eventId) mapState.programId = mapState.programId || 1;
+
+  // Switching event map → global map: destroy the event's Leaflet instance so
+  // loadMapData starts clean (either instant cache render or loading spinner).
+  // _teamsByProgram cache is unaffected — global data is kept.
+  if (wasEvent && !eventId) destroyLeafletMap();
 
   const filterEl = document.getElementById('map-filters');
   const isEvent  = !!eventId;
@@ -3708,10 +3959,12 @@ function allianceStrength(teams) {
 
 // Simulate a single elimination match; returns 'A' or 'B'.
 function simElimGame(teamsA, teamsB) {
-  const sA = allianceStrength(teamsA);
-  const sB = allianceStrength(teamsB);
-  const tot = sA + sB;
-  const probA = tot > 0 ? 0.5 + 0.45 * Math.tanh((sA - sB) / (tot * 0.35)) : 0.5;
+  const sA    = allianceStrength(teamsA);
+  const sB    = allianceStrength(teamsB);
+  const tot   = sA + sB;
+  const noise = Math.max(0, Math.min(0.5, predTuning.noise ?? 0.05));
+  const base  = tot > 0 ? 0.5 + 0.45 * Math.tanh((sA - sB) / (tot * 0.35)) : 0.5;
+  const probA = (1 - noise) * base + noise * 0.5;
   return Math.random() < probA ? 'A' : 'B';
 }
 
@@ -4958,8 +5211,14 @@ function mf(label, value) {
 function setStatus(scope, msg, type = 'info') {
   const el = document.getElementById(`${scope}-status`);
   if (!el) return;
-  el.classList.remove('hidden', 'error', 'warn');
-  el.textContent = msg;
+  el.classList.remove('hidden', 'error', 'warn', 'status-loading');
+  const isLoading = type === 'info' && /load|search|find|fetch|calculat|compil/i.test(msg);
+  if (isLoading) {
+    el.innerHTML = '<span class="status-spinner"></span><span>' + msg + '</span>';
+    el.classList.add('status-loading');
+  } else {
+    el.textContent = msg;
+  }
   if (type !== 'info') el.classList.add(type);
 }
 
@@ -6239,26 +6498,88 @@ function renderTeamEventSchedule(teamMatches, teamNumber, histData) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const compareState = {
-  slots: [null, null, null, null], // up to 4 team data objects
+  slots: [null, null, null, null],
+  programId: 1,
+  seasonId: null,
+  seasons: [],
 };
 
-function openCompareView() {
+async function openCompareView() {
   showView('view-compare');
+  if (!compareState.seasons.length) {
+    await loadCompareSeasons(compareState.programId);
+  }
+  renderCompareSeasonPicker();
   renderCompareSearchRow();
   renderCompareContent();
+}
+
+async function loadCompareSeasons(programId) {
+  const list = await fetchProgramSeasons(programId);
+  compareState.programId = programId;
+  compareState.seasons   = list;
+  compareState.seasonId  = list[0]?.id || null;
+}
+
+function renderCompareSeasonPicker() {
+  const el = document.getElementById('compare-search-row');
+  if (!el) return;
+  const programs = [{ id: 1, label: 'V5RC' }, { id: 4, label: 'VEXU' }, { id: 41, label: 'VIQRC' }];
+  const progOpts = programs.map(p =>
+    `<option value="${p.id}"${p.id === compareState.programId ? ' selected' : ''}>${p.label}</option>`
+  ).join('');
+  const seasonOpts = compareState.seasons.map(s =>
+    `<option value="${s.id}"${s.id === compareState.seasonId ? ' selected' : ''}>${esc(s.name)}</option>`
+  ).join('');
+
+  const pickerHtml = `
+    <div class="h2h-season-row" id="cmp-season-row">
+      <label class="h2h-season-label">Program</label>
+      <select class="season-picker-sel" id="cmp-prog-sel">${progOpts}</select>
+      <label class="h2h-season-label">Season</label>
+      <select class="season-picker-sel" id="cmp-season-sel">${seasonOpts || '<option>Loading…</option>'}</select>
+    </div>`;
+
+  // Only prepend picker row once (it persists; the add-row is rebuilt separately)
+  const existing = el.querySelector('#cmp-season-row');
+  if (!existing) {
+    el.insertAdjacentHTML('afterbegin', pickerHtml);
+  } else {
+    existing.outerHTML = pickerHtml;
+  }
+
+  el.querySelector('#cmp-prog-sel')?.addEventListener('change', async e => {
+    const pid = +e.target.value;
+    await loadCompareSeasons(pid);
+    compareState.slots = [null, null, null, null];
+    renderCompareSeasonPicker();
+    renderCompareSearchRow();
+    renderCompareContent();
+  });
+
+  el.querySelector('#cmp-season-sel')?.addEventListener('change', e => {
+    compareState.seasonId = +e.target.value;
+    compareState.slots = [null, null, null, null];
+    renderCompareSearchRow();
+    renderCompareContent();
+  });
 }
 
 function renderCompareSearchRow() {
   const el = document.getElementById('compare-search-row');
   const filled = compareState.slots.filter(Boolean).length;
   const canAdd = filled < 4;
-  el.innerHTML = `
-    <div class="compare-add-row">
-      ${canAdd ? `
-        <input id="cmp-input" type="text" class="compare-input" placeholder="Enter team number (e.g. 2397A)" autocomplete="off" />
-        <button id="cmp-add-btn" class="btn-primary">Add Team</button>
-      ` : `<span class="compare-max-note">4 teams added — remove one to add another.</span>`}
-    </div>`;
+  // Preserve the season picker row; only update the add row below it
+  let addRowEl = el.querySelector('.compare-add-row');
+  if (!addRowEl) {
+    addRowEl = document.createElement('div');
+    addRowEl.className = 'compare-add-row';
+    el.appendChild(addRowEl);
+  }
+  addRowEl.innerHTML = canAdd ? `
+    <input id="cmp-input" type="text" class="compare-input" placeholder="Enter team number (e.g. 2397A)" autocomplete="off" />
+    <button id="cmp-add-btn" class="btn-primary">Add Team</button>
+  ` : `<span class="compare-max-note">4 teams added — remove one to add another.</span>`;
   if (canAdd) {
     const inp = el.querySelector('#cmp-input');
     const btn = el.querySelector('#cmp-add-btn');
@@ -6278,25 +6599,24 @@ async function addCompareTeam(number) {
 
   setStatus('compare', `Loading ${number}…`);
   try {
-    const json = await apiFetch(`/teams?number[]=${encodeURIComponent(number)}&program[]=1&myTeams=false`);
+    const pid = compareState.programId || 1;
+    const json = await apiFetch(`/teams?number[]=${encodeURIComponent(number)}&program[]=${pid}&myTeams=false`);
     const team = json.data?.[0];
-    if (!team) { setStatus('compare', `Team ${number} not found in V5RC.`, 'error'); return; }
+    if (!team) { setStatus('compare', `Team ${number} not found.`, 'error'); return; }
 
-    // Find most recent season
-    const allEvents = await fetchAllPages(`/teams/${team.id}/events`);
-    const seasonMap = {};
-    allEvents.forEach(ev => {
-      if (ev.season && ev.program) {
-        const key = ev.season.id;
-        if (!seasonMap[key]) seasonMap[key] = { ...ev.season, program: ev.program };
-      }
-    });
-    const seasons = Object.values(seasonMap).sort((a, b) => b.id - a.id);
-    const season = seasons[0];
-    if (!season) { setStatus('compare', `No season data for ${number}.`, 'error'); return; }
-
-    const sid = season.id;
-    const pid = season.program?.id || 1;
+    // Use selected season; fall back to team's most recent if none
+    let sid = compareState.seasonId;
+    let season = compareState.seasons.find(s => s.id === sid) || null;
+    if (!sid) {
+      const allEvs = await fetchAllPages(`/teams/${team.id}/events`);
+      const seasonMap = {};
+      allEvs.forEach(ev => { if (ev.season) seasonMap[ev.season.id] = ev.season; });
+      season = Object.values(seasonMap).sort((a, b) => b.id - a.id)[0] || null;
+      sid = season?.id || null;
+    }
+    if (!sid) { setStatus('compare', `No season data for ${number}.`, 'error'); return; }
+    if (!season) season = { id: sid, name: '' };
+    const allEvents = await fetchAllPages(`/teams/${team.id}/events?season[]=${sid}`);
     const [rankings, skills, awards, worldEntry, allMatches] = await Promise.all([
       fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
       fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
@@ -6326,7 +6646,7 @@ async function addCompareTeam(number) {
       season,
       pid,
       sid,
-      eventsPlayed: allEvents.filter(e => e.season?.id === sid).length,
+      eventsPlayed: allEvents.length,
       rankings,
       skills,
       awards,
@@ -6348,6 +6668,7 @@ async function addCompareTeam(number) {
 
 function removeCompareSlot(idx) {
   compareState.slots[idx] = null;
+  renderCompareSeasonPicker();
   renderCompareSearchRow();
   renderCompareContent();
 }
@@ -6904,4 +7225,652 @@ function renderLiveFeed(feedEl, eventCount, noData) {
 // Stop polling when leaving the live view
 function stopLivePolling() {
   if (liveState.timer) { clearInterval(liveState.timer); liveState.timer = null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEAD TO HEAD PREDICTOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+let h2hState     = { red: [null, null], blue: [null, null] };
+let h2hTeamData  = {}; // name → { name, opr, ccwm, dpr, winRate, skillsCombined, source, timeline[] }
+let h2hSeason    = { programId: 1, seasonId: null, seasons: [] };
+let h2hSliderPos = null; // null = max (full season); number = event index cutoff
+
+async function openH2HView() {
+  showView('view-h2h');
+  // Init season list on first open
+  if (!h2hSeason.seasons.length) {
+    await loadH2HSeasons(h2hSeason.programId);
+  }
+  renderH2HPanel();
+}
+
+async function loadH2HSeasons(programId) {
+  const list = await fetchProgramSeasons(programId);
+  h2hSeason.programId = programId;
+  h2hSeason.seasons   = list;
+  h2hSeason.seasonId  = list[0]?.id || null;
+}
+
+async function fetchH2HTeamData(teamNum) {
+  const key = teamNum.toUpperCase().trim();
+
+  // If an event is loaded and this team is in it, use live event data (no timeline)
+  const eventName = Object.keys(cachedOPR).find(n =>
+    n.toUpperCase() === key || n.replace(/\s+/g,'').toUpperCase() === key.replace(/\s+/g,'')
+  );
+  if (eventName && currentEvent) {
+    const opr  = cachedOPR[eventName] || {};
+    const rank = cachedEventRankings[eventName] || {};
+    const sk   = cachedEventSkills[eventName] || {};
+    return {
+      name: eventName, source: 'event', timeline: [],
+      opr: opr.opr || 0, ccwm: opr.ccwm || 0, dpr: opr.dpr || 0,
+      winRate: rank.winRate ?? 0.5, skillsCombined: sk.combined || 0,
+      wins: rank.wins || 0, losses: rank.losses || 0, ties: rank.ties || 0,
+    };
+  }
+
+  const json = await apiFetch(`/teams?number[]=${encodeURIComponent(teamNum)}&myTeams=false`);
+  const team = json.data?.[0];
+  if (!team) return null;
+  // Always use team.number as the key — it matches t.team.name inside match alliance data.
+  // team.name on the /teams endpoint may be the org name (e.g. "BLRS"), not the number.
+  const teamKey = team.number || teamNum;
+
+  // Resolve season: prefer the user-selected season when the program matches,
+  // otherwise fall back to auto-detecting from the team's own events.
+  const teamProgId = team.program?.id;
+  let sid = (teamProgId && teamProgId !== h2hSeason.programId) ? null : h2hSeason.seasonId;
+
+  const autoDetectSid = async () => {
+    const evs = await fetchAllPages(`/teams/${team.id}/events`);
+    const byS = {};
+    evs.forEach(e => { if (e.season?.id) byS[e.season.id] = e.season; });
+    return Object.values(byS).sort((a, b) => b.id - a.id)[0]?.id || null;
+  };
+
+  if (!sid) sid = await autoDetectSid();
+  if (!sid) return { name: teamKey, source: 'season', timeline: [], opr: 0, ccwm: 0, dpr: 0, winRate: 0.5, skillsCombined: 0, wins: 0, losses: 0, ties: 0 };
+
+  let [allMatches, rankings, skills, teamEvents] = await Promise.all([
+    fetchAllPages(`/teams/${team.id}/matches?season[]=${sid}`),
+    fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
+    fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
+    fetchAllPages(`/teams/${team.id}/events?season[]=${sid}`),
+  ]);
+
+  // If we got no qual matches with the selected season, auto-detect and retry once.
+  if (!allMatches.some(m => m.round === 2) && sid === h2hSeason.seasonId) {
+    const autoSid = await autoDetectSid();
+    if (autoSid && autoSid !== sid) {
+      sid = autoSid;
+      [allMatches, rankings, skills, teamEvents] = await Promise.all([
+        fetchAllPages(`/teams/${team.id}/matches?season[]=${sid}`),
+        fetchAllPages(`/teams/${team.id}/rankings?season[]=${sid}`),
+        fetchAllPages(`/teams/${team.id}/skills?season[]=${sid}`),
+        fetchAllPages(`/teams/${team.id}/events?season[]=${sid}`),
+      ]);
+    }
+  }
+
+  // Group by event ID
+  const matchesByEvent = {};
+  allMatches.forEach(m => {
+    if (m.round !== 2) return;
+    const eid = m.event?.id;
+    if (eid) (matchesByEvent[eid] = matchesByEvent[eid] || []).push(m);
+  });
+  const rankByEvent = {};
+  rankings.forEach(r => { if (r.event?.id) rankByEvent[r.event.id] = r; });
+  const skillsByEvent = {};
+  skills.forEach(s => {
+    const eid = s.event?.id; if (!eid) return;
+    if (!skillsByEvent[eid]) skillsByEvent[eid] = { driver: 0, prog: 0 };
+    if (s.type === 'driver')      skillsByEvent[eid].driver = Math.max(skillsByEvent[eid].driver, s.score || 0);
+    else if (s.type === 'programming') skillsByEvent[eid].prog = Math.max(skillsByEvent[eid].prog, s.score || 0);
+  });
+
+  // Sort events chronologically; fall back to events without start date at the end
+  const sortedEvents = teamEvents
+    .filter(e => e.id)
+    .sort((a, b) => {
+      if (a.start && b.start) return new Date(a.start) - new Date(b.start);
+      if (a.start) return -1;
+      if (b.start) return 1;
+      return 0;
+    });
+
+  // Compute per-team score contribution for a set of matches.
+  // Uses direct average-score approach (always works; more robust than OPR system solve).
+  function computeScoreContrib(evMs) {
+    const scored = evMs.filter(m => matchIsScored(m));
+    if (!scored.length) return { opr: 0, ccwm: 0 };
+    let ownTotal = 0, oppTotal = 0, n = 0;
+    for (const m of scored) {
+      const als = m.alliances || [];
+      const myA = als.find(a =>
+        (a.teams || []).some(t => t.team?.name === teamKey)
+      );
+      if (!myA || myA.score == null) continue;
+      const oppA = als.find(a => a !== myA);
+      // Divide by number of present teammates to get per-player contribution
+      const sz = Math.max(1, (myA.teams || []).filter(t => t.team?.name).length);
+      ownTotal += myA.score / sz;
+      if (oppA?.score != null) oppTotal += oppA.score / sz;
+      n++;
+    }
+    if (!n) return { opr: 0, ccwm: 0 };
+    return { opr: ownTotal / n, ccwm: (ownTotal - oppTotal) / n };
+  }
+
+  // Build timeline
+  const timeline = [];
+  let cumW = 0, cumL = 0, cumT = 0, bestDriver = 0, bestProg = 0;
+  for (const ev of sortedEvents) {
+    const eid  = ev.id;
+    const evMs = matchesByEvent[eid] || [];
+    const evR  = rankByEvent[eid];
+    const evSk = skillsByEvent[eid] || { driver: 0, prog: 0 };
+
+    const { opr, ccwm } = computeScoreContrib(evMs);
+
+    const eW = evR?.wins || 0, eL = evR?.losses || 0, eT = evR?.ties || 0;
+    cumW += eW; cumL += eL; cumT += eT;
+    bestDriver = Math.max(bestDriver, evSk.driver);
+    bestProg   = Math.max(bestProg, evSk.prog);
+
+    const cumTotal = cumW + cumL + cumT;
+    const shortDate = ev.start ? ev.start.slice(0, 10) : '';
+    timeline.push({
+      eventId: eid,
+      eventName: ev.name || `Event ${timeline.length + 1}`,
+      date: shortDate,
+      opr, ccwm, dpr: Math.max(0, opr - ccwm),
+      wins: eW, losses: eL, ties: eT,
+      skillsCombined: evSk.driver + evSk.prog,
+      cumWins: cumW, cumLosses: cumL, cumTies: cumT,
+      cumWinRate: cumTotal > 0 ? cumW / cumTotal : null,
+    });
+  }
+
+  // Full-season averages from events that had real match data
+  const validEntries = timeline.filter(t => t.opr > 0);
+  const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const cumTotal = cumW + cumL + cumT;
+
+  // Weight recent events more (last 3 events carry double weight for current form)
+  const recentN = Math.min(3, validEntries.length);
+  const recentEntries = validEntries.slice(-recentN);
+  const olderEntries  = validEntries.slice(0, validEntries.length - recentN);
+  const weightedOPR  = (avg(recentEntries.map(t => t.opr))  * 2 * recentN
+                      + avg(olderEntries.map(t => t.opr))   * olderEntries.length)
+                     / Math.max(1, 2 * recentN + olderEntries.length);
+  const weightedCCWM = (avg(recentEntries.map(t => t.ccwm)) * 2 * recentN
+                      + avg(olderEntries.map(t => t.ccwm))  * olderEntries.length)
+                     / Math.max(1, 2 * recentN + olderEntries.length);
+
+  return {
+    name: teamKey, source: 'season', timeline,
+    opr:  validEntries.length ? weightedOPR : 0,
+    ccwm: validEntries.length ? weightedCCWM : 0,
+    dpr:  Math.max(0, (validEntries.length ? weightedOPR - weightedCCWM : 0)),
+    winRate: cumTotal > 0 ? cumW / cumTotal : 0.5,
+    skillsCombined: bestDriver + bestProg,
+    wins: cumW, losses: cumL, ties: cumT,
+  };
+}
+
+// Return stats for a team at a specific event-index cutoff (1-based).
+function h2hDataAtPos(name, pos) {
+  const d = h2hTeamData[name];
+  if (!d) return null;
+  if (!d.timeline || !d.timeline.length) return d;
+
+  const events = d.timeline.slice(0, Math.max(1, pos));
+  const validOPRs = events.filter(e => e.opr > 0);
+  const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const avgOPR  = avg(validOPRs.map(e => e.opr));
+  const avgCCWM = avg(validOPRs.map(e => e.ccwm));
+  const last = events[events.length - 1];
+  const cumTotal = last.cumWins + last.cumLosses + last.cumTies;
+
+  return {
+    ...d,
+    opr:  avgOPR,
+    ccwm: avgCCWM,
+    dpr:  Math.max(0, avgOPR - avgCCWM),
+    winRate: cumTotal > 0 ? last.cumWins / cumTotal : 0.5,
+    skillsCombined: events.reduce((m, e) => Math.max(m, e.skillsCombined), 0),
+    wins: last.cumWins, losses: last.cumLosses, ties: last.cumTies,
+  };
+}
+
+// Max events across all loaded teams (for slider range).
+function h2hMaxPos() {
+  return Math.max(1, ...Object.values(h2hTeamData).map(d => d.timeline?.length || 0));
+}
+
+// Current effective slider position (default = max).
+function h2hEffectivePos() {
+  const max = h2hMaxPos();
+  return h2hSliderPos === null ? max : Math.min(h2hSliderPos, max);
+}
+
+// Inline SVG sparkline for a stat key over a team's timeline.
+function renderSparkline(timeline, key, currentPos, w = 90, h = 28) {
+  if (!timeline || timeline.length < 2) return '';
+  const vals = timeline.map(t => t[key] ?? null);
+  const valid = vals.filter(v => v != null && v > 0);
+  if (!valid.length) return '';
+
+  const minV = Math.min(...valid) * 0.88;
+  const maxV = Math.max(...valid) * 1.08;
+  const range = maxV - minV || 1;
+  const pad = 3;
+
+  const pts = vals.map((v, i) => {
+    const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+    const y = v != null ? pad + (1 - (v - minV) / range) * (h - pad * 2) : null;
+    return { x, y };
+  }).filter(p => p.y != null);
+
+  const path = pts.map((p, i) => `${i ? 'L' : 'M'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+
+  const currIdx = Math.min(currentPos - 1, timeline.length - 1);
+  const currPt  = pts[currIdx] || pts[pts.length - 1];
+
+  // Area fill
+  const areaPath = `${path} L${pts[pts.length - 1].x.toFixed(1)},${(h - pad).toFixed(1)} L${pts[0].x.toFixed(1)},${(h - pad).toFixed(1)} Z`;
+
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="h2h-spark">
+    <defs>
+      <linearGradient id="sg-${name}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <path d="${areaPath}" fill="url(#sg-${name})" />
+    <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round" opacity="0.7"/>
+    ${currIdx < pts.length - 1
+      ? `<circle cx="${pts[pts.length-1].x.toFixed(1)}" cy="${pts[pts.length-1].y.toFixed(1)}" r="2" fill="var(--text-muted)" opacity="0.35"/>`
+      : ''}
+    <circle cx="${currPt.x.toFixed(1)}" cy="${currPt.y.toFixed(1)}" r="3.5"
+            fill="var(--accent)" stroke="var(--surface)" stroke-width="1.5"/>
+  </svg>`;
+}
+
+// Build a normalized stat cache for exactly the given team names using h2hTeamData.
+// pos = slider position (1-based); null/undefined = full season.
+function buildH2HMiniCache(names, pos) {
+  const raw = {};
+  for (const name of names) {
+    if (!name) continue;
+    const ev = cachedOPR[name];
+    if (ev) {
+      const rank = cachedEventRankings[name] || {};
+      const sk   = cachedEventSkills[name] || {};
+      raw[name] = {
+        opr:    ev.opr || 0,
+        ccwm:   ev.ccwm || 0,
+        dpr:    ev.dpr || 0,
+        wr:     rank.winRate ?? 0.5,
+        skills: sk.combined || 0,
+        form:   ev.opr || 0,
+        consist: 0.5,
+      };
+    } else {
+      const d = (pos != null && h2hTeamData[name]?.timeline?.length)
+        ? h2hDataAtPos(name, pos)
+        : h2hTeamData[name];
+      if (!d) continue;
+      raw[name] = {
+        opr:    d.opr || 0,
+        ccwm:   d.ccwm || 0,
+        dpr:    d.dpr || 0,
+        wr:     d.winRate ?? 0.5,
+        skills: d.skillsCombined || 0,
+        form:   d.opr || 0,
+        consist: 0.5,
+      };
+    }
+  }
+
+  const keys = Object.keys(raw);
+  if (!keys.length) return {};
+
+  // Min-max normalize within these teams
+  const dims = ['opr', 'ccwm', 'dpr', 'skills', 'form'];
+  const mm = {};
+  for (const dim of dims) {
+    const vals = keys.map(n => raw[n][dim]).filter(isFinite);
+    mm[dim] = { min: Math.min(...vals), max: Math.max(...vals) };
+  }
+
+  const cache = {};
+  for (const name of keys) {
+    const r = raw[name];
+    const n01 = (dim, invert = false) => {
+      const { min, max } = mm[dim];
+      const v = max > min ? (r[dim] - min) / (max - min) : 0.5;
+      return invert ? 1 - v : v;
+    };
+    cache[name] = {
+      opr_n:    n01('opr'),
+      ccwm_n:   n01('ccwm'),
+      dpr_n:    n01('dpr', true),
+      wr:       Math.max(0, Math.min(1, r.wr)),
+      skills_n: n01('skills'),
+      form_n:   n01('form'),
+      consist_n: 0.5,
+    };
+  }
+  return cache;
+}
+
+// Predict a H2H match using current predTuning weights.
+// Merges event cache (if available) with the H2H mini-cache, slider-position-aware.
+function predictH2H(redSlots, blueSlots) {
+  const redNames  = redSlots.filter(Boolean);
+  const blueNames = blueSlots.filter(Boolean);
+  if (!redNames.length || !blueNames.length) return null;
+
+  const allNames = [...redNames, ...blueNames];
+  const pos = h2hEffectivePos();
+
+  const eventCache = getPredStatCache();
+  const miniCache  = buildH2HMiniCache(allNames, pos);
+  const combined   = {};
+  for (const name of allNames) {
+    combined[name] = eventCache[name] || miniCache[name] || null;
+  }
+
+  const ALLIANCE_SIZE = 2; // standard VEX alliance size
+  const getOPR = name => {
+    const d = h2hTeamData[name]?.timeline?.length
+      ? h2hDataAtPos(name, pos)
+      : h2hTeamData[name];
+    if (d && d.opr > 0) return d.opr;
+    return effectiveOPR(name);
+  };
+  // Sum OPRs; scale to full alliance size if fewer teams added
+  const rawRed  = redNames.reduce((s, n) => s + getOPR(n), 0);
+  const rawBlue = blueNames.reduce((s, n) => s + getOPR(n), 0);
+  const oprRed  = rawRed  * (ALLIANCE_SIZE / Math.max(1, redNames.length));
+  const oprBlue = rawBlue * (ALLIANCE_SIZE / Math.max(1, blueNames.length));
+
+  // Multi-stat strength for win direction + confidence
+  const strRed  = redNames.reduce((s, n)  => s + teamStrength(n, combined), 0);
+  const strBlue = blueNames.reduce((s, n) => s + teamStrength(n, combined), 0);
+  const total   = strRed + strBlue;
+
+  if (total <= 0) {
+    const winner = oprRed > oprBlue ? 'red' : oprBlue > oprRed ? 'blue' : 'tie';
+    return { redScore: Math.max(0, Math.round(oprRed)), blueScore: Math.max(0, Math.round(oprBlue)), winner, confidence: 55 };
+  }
+
+  const diff  = Math.abs(strRed - strBlue);
+  const ts    = predTuning.tanhScale > 0 ? predTuning.tanhScale : 0.22;
+  const noise = Math.max(0, Math.min(0.5, predTuning.noise ?? 0.05));
+  const baseProb = 0.5 + 0.45 * Math.tanh(diff / (total * ts));
+  const adjProb  = (1 - noise) * baseProb + noise * 0.5;
+  const confidence = Math.min(87, Math.round(adjProb * 100));
+
+  return {
+    redScore:  Math.max(0, Math.round(oprRed)),
+    blueScore: Math.max(0, Math.round(oprBlue)),
+    winner:    strRed > strBlue ? 'red' : strBlue > strRed ? 'blue' : 'tie',
+    confidence,
+  };
+}
+
+function renderH2HTeamCard(alliance, idx, data) {
+  if (!data) return '';
+  const pos = h2hEffectivePos();
+  const hasTimeline = data.timeline?.length >= 2;
+  const statsNow = hasTimeline ? h2hDataAtPos(data.name, pos) : data;
+  const isSliding = hasTimeline && h2hSliderPos != null && h2hSliderPos < data.timeline.length;
+
+  const fmt = (v, digits = 1) => (v != null && v > 0) ? (+v).toFixed(digits) : '—';
+  const opr   = fmt(statsNow.opr);
+  const ccwm  = statsNow.ccwm != null && (statsNow.ccwm !== 0 || statsNow.opr > 0) ? (+statsNow.ccwm).toFixed(1) : '—';
+  const wr    = statsNow.winRate != null ? Math.round(statsNow.winRate * 100) + '%' : '—';
+  const sk    = statsNow.skillsCombined > 0 ? statsNow.skillsCombined : '—';
+  const wlt   = statsNow.wins + statsNow.losses + statsNow.ties > 0
+    ? `${statsNow.wins}W-${statsNow.losses}L-${statsNow.ties}T` : '—';
+  const src   = data.source === 'event' ? 'event data' : 'season data';
+
+  const delta = (cur, full) => {
+    if (!isSliding) return '';
+    const c = parseFloat(cur), f = parseFloat(full);
+    if (!isFinite(c) || !isFinite(f) || Math.abs(c - f) < 0.05) return '';
+    const diff = c - f;
+    return `<span class="h2h-delta ${diff > 0 ? 'h2h-delta-pos' : 'h2h-delta-neg'}">${diff > 0 ? '+' : ''}${diff.toFixed(1)}</span>`;
+  };
+
+  const oprSpark = hasTimeline ? renderSparkline(data.timeline, 'opr',        pos, 80, 26) : '';
+  const wrSpark  = hasTimeline ? renderSparkline(data.timeline, 'cumWinRate',  pos, 80, 26) : '';
+
+  return `
+    <div class="h2h-team-card h2h-card-${alliance}">
+      <div class="h2h-card-header">
+        <span class="h2h-card-name">${data.name}</span>
+        <span class="h2h-card-src">${src}</span>
+        <button class="h2h-remove-btn" data-alliance="${alliance}" data-idx="${idx}" title="Remove">✕</button>
+      </div>
+      <div class="h2h-stats-grid">
+        <div class="h2h-stat">
+          <span class="h2h-stat-val">${opr}${delta(opr, fmt(data.opr))}</span>
+          <span class="h2h-stat-lbl">OPR</span>
+          ${oprSpark ? `<div class="h2h-spark-wrap">${oprSpark}</div>` : ''}
+        </div>
+        <div class="h2h-stat">
+          <span class="h2h-stat-val">${ccwm}${delta(ccwm, fmt(data.ccwm))}</span>
+          <span class="h2h-stat-lbl">CCWM</span>
+          ${wrSpark ? `<div class="h2h-spark-wrap">${wrSpark}</div>` : ''}
+        </div>
+        <div class="h2h-stat"><span class="h2h-stat-val">${wr}</span><span class="h2h-stat-lbl">Win %</span></div>
+        <div class="h2h-stat"><span class="h2h-stat-val">${sk}</span><span class="h2h-stat-lbl">Skills</span></div>
+        <div class="h2h-stat h2h-stat-wide"><span class="h2h-stat-val">${wlt}</span><span class="h2h-stat-lbl">W-L-T</span></div>
+      </div>
+    </div>`;
+}
+
+function renderH2HAddSlot(alliance, idx) {
+  return `
+    <div class="h2h-add-slot" id="h2h-slot-${alliance}-${idx}">
+      <input type="text" class="h2h-input" id="h2h-input-${alliance}-${idx}"
+        placeholder="Team number…" autocomplete="off" />
+      <button class="btn-primary h2h-add-btn" data-alliance="${alliance}" data-idx="${idx}">Add</button>
+    </div>`;
+}
+
+function renderH2HPredSection() {
+  const pred = predictH2H(h2hState.red, h2hState.blue);
+  if (!pred) return `<div class="h2h-pred-placeholder">Add at least one team to each alliance to predict.</div>`;
+
+  const isTie    = pred.winner === 'tie';
+  const redWin   = pred.winner === 'red';
+  const redBarPct = redWin ? pred.confidence : (isTie ? 50 : 100 - pred.confidence);
+  const confClass = pred.confidence >= 70 ? 'h2h-conf-high' : pred.confidence >= 60 ? 'h2h-conf-mid' : 'h2h-conf-low';
+  const winnerLabel = isTie ? '⚖ Toss-up' : (redWin ? '🔴 Red favored' : '🔵 Blue favored');
+
+  return `
+    <div class="h2h-pred-section">
+      <div class="h2h-pred-label">Match Prediction</div>
+      <div class="h2h-scores-row">
+        <div class="h2h-score-box h2h-score-red${redWin ? ' h2h-score-winner' : ''}">${pred.redScore}</div>
+        <div class="h2h-score-vs">—</div>
+        <div class="h2h-score-box h2h-score-blue${pred.winner === 'blue' ? ' h2h-score-winner' : ''}">${pred.blueScore}</div>
+      </div>
+      <div class="h2h-bar-row">
+        <span class="h2h-bar-side h2h-bar-side-red">Red ${redBarPct}%</span>
+        <div class="h2h-win-bar">
+          <div class="h2h-win-fill-red" style="width:${redBarPct}%"></div>
+          <div class="h2h-win-fill-blue" style="width:${100 - redBarPct}%"></div>
+        </div>
+        <span class="h2h-bar-side h2h-bar-side-blue">${100 - redBarPct}% Blue</span>
+      </div>
+      <div class="h2h-pred-footer">
+        <span class="${confClass}">Confidence: ${pred.confidence}%</span>
+        <span class="h2h-winner-label">${winnerLabel}</span>
+      </div>
+    </div>`;
+}
+
+function getH2HTimelineLabel(pos) {
+  const max = h2hMaxPos();
+  if (pos >= max) return 'Full season';
+  for (const d of Object.values(h2hTeamData)) {
+    const ev = d.timeline?.[pos - 1];
+    if (ev?.eventName) {
+      const short = ev.eventName.length > 30 ? ev.eventName.slice(0, 30) + '…' : ev.eventName;
+      const dateStr = ev.date ? ` · ${ev.date.slice(5, 10)}` : '';
+      return `Through: ${short}${dateStr}`;
+    }
+  }
+  return `Event ${pos} of ${max}`;
+}
+
+function renderH2HTimeline() {
+  const max = h2hMaxPos();
+  if (max <= 1) return '';
+  const pos = h2hEffectivePos();
+  return `
+    <div class="h2h-timeline-section">
+      <div class="h2h-timeline-header">
+        <span class="h2h-timeline-title">Season Timeline</span>
+        <span class="h2h-timeline-pos" id="h2h-timeline-pos">${getH2HTimelineLabel(pos)}</span>
+      </div>
+      <div class="h2h-timeline-row">
+        <span class="h2h-timeline-end">Ev 1</span>
+        <input type="range" id="h2h-slider" class="h2h-slider"
+               min="1" max="${max}" value="${pos}" step="1" />
+        <span class="h2h-timeline-end">Full ▶</span>
+      </div>
+    </div>`;
+}
+
+function renderH2HSeasonPicker() {
+  const programs = [{ id: 1, label: 'V5RC' }, { id: 4, label: 'VEXU' }, { id: 41, label: 'VIQRC' }];
+  const progOpts = programs.map(p =>
+    `<option value="${p.id}"${p.id === h2hSeason.programId ? ' selected' : ''}>${p.label}</option>`
+  ).join('');
+  const seasonOpts = h2hSeason.seasons.map(s =>
+    `<option value="${s.id}"${s.id === h2hSeason.seasonId ? ' selected' : ''}>${esc(s.name)}</option>`
+  ).join('');
+  return `
+    <div class="h2h-season-row">
+      <label class="h2h-season-label">Program</label>
+      <select class="season-picker-sel" id="h2h-prog-sel">${progOpts}</select>
+      <label class="h2h-season-label">Season</label>
+      <select class="season-picker-sel" id="h2h-season-sel">${seasonOpts || '<option>Loading…</option>'}</select>
+      <span class="h2h-season-note">Teams added above will use this season's data.</span>
+    </div>`;
+}
+
+function renderH2HAllianceBlock(alliance) {
+  const title = alliance === 'red' ? '🔴 Red Alliance' : '🔵 Blue Alliance';
+  let slots = '';
+  for (let i = 0; i < 2; i++) {
+    const name = h2hState[alliance][i];
+    const data = name ? h2hTeamData[name] : null;
+    if (name && data) slots += renderH2HTeamCard(alliance, i, data);
+    else if (!name)   slots += renderH2HAddSlot(alliance, i);
+  }
+  return `<div class="h2h-alliance h2h-alliance-${alliance}"><div class="h2h-alliance-title">${title}</div>${slots}</div>`;
+}
+
+function renderH2HMainContent() {
+  return `
+    ${renderH2HAllianceBlock('red')}
+    <div class="h2h-center">${renderH2HPredSection()}</div>
+    ${renderH2HAllianceBlock('blue')}`;
+}
+
+function renderH2HPanel() {
+  const root = document.getElementById('h2h-root');
+  if (!root) return;
+  root.innerHTML = `
+    ${renderH2HSeasonPicker()}
+    <div class="h2h-layout" id="h2h-main-layout">${renderH2HMainContent()}</div>
+    ${renderH2HTimeline()}`;
+  wireH2H(root);
+}
+
+function wireH2HDynamic(root) {
+  root.querySelectorAll('.h2h-remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      h2hState[btn.dataset.alliance][parseInt(btn.dataset.idx, 10)] = null;
+      renderH2HPanel();
+    });
+  });
+
+  root.querySelectorAll('.h2h-add-btn').forEach(btn => {
+    const alliance = btn.dataset.alliance;
+    const idx = parseInt(btn.dataset.idx, 10);
+    const input = root.querySelector(`#h2h-input-${alliance}-${idx}`);
+
+    const doAdd = async () => {
+      const num = input?.value.trim();
+      if (!num) return;
+      btn.disabled = true; btn.textContent = 'Loading…';
+      try {
+        const data = await fetchH2HTeamData(num);
+        if (!data) {
+          btn.textContent = 'Not found';
+          setTimeout(() => { btn.disabled = false; btn.textContent = 'Add'; }, 1800);
+          return;
+        }
+        h2hTeamData[data.name] = data;
+        h2hState[alliance][idx] = data.name;
+        h2hSliderPos = null;
+        renderH2HPanel();
+      } catch (_) {
+        btn.textContent = 'Error';
+        setTimeout(() => { btn.disabled = false; btn.textContent = 'Add'; }, 1800);
+      }
+    };
+
+    btn.addEventListener('click', doAdd);
+    if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') doAdd(); });
+  });
+}
+
+function wireH2H(root) {
+  const progSel = root.querySelector('#h2h-prog-sel');
+  if (progSel) {
+    progSel.addEventListener('change', async () => {
+      await loadH2HSeasons(+progSel.value);
+      h2hState = { red: [null, null], blue: [null, null] };
+      h2hTeamData = {}; h2hSliderPos = null;
+      renderH2HPanel();
+    });
+  }
+
+  const seasonSel = root.querySelector('#h2h-season-sel');
+  if (seasonSel) {
+    seasonSel.addEventListener('change', () => {
+      h2hSeason.seasonId = +seasonSel.value;
+      h2hState = { red: [null, null], blue: [null, null] };
+      h2hTeamData = {}; h2hSliderPos = null;
+      renderH2HPanel();
+    });
+  }
+
+  const slider = root.querySelector('#h2h-slider');
+  if (slider) {
+    slider.addEventListener('input', () => {
+      const max = h2hMaxPos();
+      const val = parseInt(slider.value, 10);
+      h2hSliderPos = val >= max ? null : val;
+      const posEl = root.querySelector('#h2h-timeline-pos');
+      if (posEl) posEl.textContent = getH2HTimelineLabel(h2hSliderPos === null ? max : val);
+      const layout = root.querySelector('#h2h-main-layout');
+      if (layout) { layout.innerHTML = renderH2HMainContent(); wireH2HDynamic(root); }
+    });
+  }
+
+  wireH2HDynamic(root);
 }

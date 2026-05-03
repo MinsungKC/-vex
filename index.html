@@ -17,6 +17,8 @@
       <button class="notif-bell-btn" id="notif-bell" title="Notifications &amp; Watchlist" aria-label="Notifications">
         🔔<span class="notif-badge" id="notif-badge" style="display:none"></span>
       </button>
+      <button class="glass-toggle-btn" id="glass-toggle" title="Toggle glass mode" aria-label="Toggle glass mode">Glass</button>
+      <button class="mode-toggle-btn" id="mode-toggle" title="Toggle UI complexity" aria-label="Toggle UI mode">Simple</button>
       <label class="theme-switch-wrap" title="Toggle dark mode" aria-label="Toggle dark mode">
         <span class="theme-icon">☀︎</span>
         <span class="toggle-switch">
@@ -27,6 +29,7 @@
       </label>
     </div>
   </header>
+  <div id="global-loader"><div id="global-loader-bar"></div></div>
   <div id="notif-panel" class="notif-panel hidden"></div>
 
   <main class="app-shell">
@@ -41,10 +44,11 @@
       <div class="tabs">
         <button class="tab active" data-tab="team">By Team Number</button>
         <button class="tab" data-tab="event">Browse Events</button>
-        <button class="tab" data-tab="standings">Standings</button>
-        <button class="tab" data-tab="map" id="map-nav-btn">Explore Teams</button>
-        <button class="tab" data-tab="compare">Compare Teams</button>
-        <button class="tab" data-tab="live">Live</button>
+        <button class="tab complex-only" data-tab="standings">Standings</button>
+        <button class="tab complex-only" data-tab="map" id="map-nav-btn">Explore Teams</button>
+        <button class="tab complex-only" data-tab="compare">Compare Teams</button>
+        <button class="tab complex-only" data-tab="live">Live</button>
+        <button class="tab complex-only" data-tab="h2h">H2H</button>
       </div>
 
       <!-- Team search panel -->
@@ -134,6 +138,16 @@
       <div id="live-controls"></div>
       <div id="live-status" class="status hidden"></div>
       <div id="live-feed"></div>
+    </div>
+
+    <!-- ── H2H Predictor view ── -->
+    <div id="view-h2h" class="view hidden">
+      <button class="back-btn" id="back-from-h2h">← Back</button>
+      <div class="page-heading">
+        <h1>Head to Head</h1>
+        <p class="page-sub">Build two alliances and see a predicted match outcome using the current prediction weights.</p>
+      </div>
+      <div id="h2h-root"></div>
     </div>
 
     <!-- ── World Map view ── -->
